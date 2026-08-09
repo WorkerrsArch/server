@@ -1,3 +1,8 @@
+// -std=c11 (в отличие от -std=gnu11) отключает POSIX-расширения glibc —
+// без этого clock_gettime/CLOCK_MONOTONIC/getaddrinfo/struct addrinfo
+// не объявлены. Должно стоять до ЛЮБОГО #include в файле.
+#define _POSIX_C_SOURCE 200809L
+
 #include "network.h"
 #ifndef NETWORK_HEADLESS_BUILD
     #include "raymath.h"

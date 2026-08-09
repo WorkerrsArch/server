@@ -6,6 +6,9 @@
 // Собирается отдельно от графического клиента:
 //   gcc -O2 -DNETWORK_HEADLESS_BUILD -o server server_main.c network.c -lm
 
+// см. network.c — без этого usleep()/useconds_t не объявлены под -std=c11
+#define _POSIX_C_SOURCE 200809L
+
 #include "network.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,7 +17,7 @@
 #ifdef _WIN32
     #include <windows.h>
 #else
-    #include <unistd.h>
+    #include <time.h>
     #include <signal.h>
 #endif
 
@@ -28,7 +31,10 @@ static void SleepMs(int ms) {
 #ifdef _WIN32
     Sleep((DWORD)ms);
 #else
-    usleep((useconds_t)ms * 1000);
+    struct timespec ts;
+    ts.tv_sec = ms / 1000;
+    ts.tv_nsec = (long)(ms % 1000) * 1000000L;
+    nanosleep(&ts, NULL);
 #endif
 }
 
