@@ -26,6 +26,7 @@
     #include <unistd.h>
     #include <fcntl.h>
     #include <errno.h>
+    #include <netinet/tcp.h>   // TCP_NODELAY
     #define SOCKET int
     #define INVALID_SOCKET -1
     #define SOCKET_ERROR -1
@@ -102,6 +103,18 @@ static void SetNonBlocking(SOCKET s) {
     int flags = fcntl(s, F_GETFL, 0);
     if (flags >= 0) fcntl(s, F_SETFL, flags | O_NONBLOCK);
 #endif
+}
+
+// Без этого TCP-стек (алгоритм Нейгла) придерживает мелкие пакеты
+// (PlayerState шлётся каждый тик - как раз "мелкий" в терминах TCP),
+// ожидая либо накопления данных до MSS, либо ACK на предыдущий сегмент.
+// В связке с delayed ACK на другой стороне это стабильно добавляет
+// 40-200мс к каждому пакету - именно это ощущается как "высокий пинг"
+// при полностью рабочей сети. Ставим на КАЖДЫЙ сокет, который шлёт
+// данные: клиентский sock и каждый accept()-нутый серверный сокет.
+static void SetTcpNoDelay(SOCKET s) {
+    int flag = 1;
+    setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char*)&flag, sizeof(flag));
 }
 
 // Досылает данные целиком: send() на TCP может отправить меньше, чем
@@ -262,6 +275,7 @@ bool Network_InitClient(const char *serverAddr) {
         closesocket(sock); sock = INVALID_SOCKET; return false;
     }
     SetNonBlocking(sock);
+    SetTcpNoDelay(sock);
     recvStreamLen = 0;
 
     isServer = false;
@@ -376,6 +390,7 @@ static void AcceptNewConnections(void) {
         SOCKET c = accept(listenSock, (struct sockaddr*)&from, &fromLen);
         if (c == INVALID_SOCKET) break;
         SetNonBlocking(c);
+        SetTcpNoDelay(c);
 
         int base = hostPlaysToo ? 1 : 0;
         int idx = -1;
