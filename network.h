@@ -45,6 +45,8 @@ typedef struct {
     Vector3 direction;
     int weaponType;
     int shooterId;
+    float damage;
+    bool headshot;
 } HitEvent;
 
 typedef struct {
