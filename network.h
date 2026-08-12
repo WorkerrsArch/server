@@ -1,5 +1,6 @@
 #pragma once
 #include <stdbool.h>
+#include <stdint.h>
 
 // Обычный графический клиент собирается с raylib как раньше.
 // Headless dedicated-server собирается с -DNETWORK_HEADLESS_BUILD и
