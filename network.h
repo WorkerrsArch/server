@@ -84,3 +84,16 @@ PlayerState Network_GetSelfAuthoritativeState(void); // clientStates[0], вал�
 // Настоящий выделенный сервер: без локального игрока, слот 0 - обычный
 // клиентский слот. Используется в server_main.c для деплоя на Railway.
 bool Network_InitDedicatedServer(int port);
+
+// ---- Карта сервера ----
+// Клиент после коннекта скачивает/проверяет карту (CRC32). Кэш: data/server_map.dat
+// Сервер раздаёт файл из Network_LoadMapFile (обычно data/custom.dat или map/custom.dat).
+// size==0 → клиенты играют на дефолтной арене.
+#define NETWORK_MAP_CACHE_PATH     "data/server_map.dat"
+#define NETWORK_MAP_HOST_PATH      "data/custom.dat"
+#define NETWORK_MAP_DEDICATED_PATH "map/custom.dat"
+
+bool Network_LoadMapFile(const char *path);
+const char *Network_MapCachePath(void);
+uint32_t Network_MapCrc(void);
+uint32_t Network_MapSize(void);
