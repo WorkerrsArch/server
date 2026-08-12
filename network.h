@@ -87,12 +87,12 @@ PlayerState Network_GetSelfAuthoritativeState(void); // clientStates[0], вал�
 bool Network_InitDedicatedServer(int port);
 
 // ---- Карта сервера ----
-// Клиент после коннекта скачивает/проверяет карту (CRC32). Кэш: data/server_map.dat
-// Сервер раздаёт файл из Network_LoadMapFile (обычно data/custom.dat или map/custom.dat).
+// Клиент после коннекта скачивает/проверяет карту (CRC32). Кэш: server_map.dat
+// Сервер/редактор: custom.dat в текущей рабочей папке (рядом с бинарником).
 // size==0 → клиенты играют на дефолтной арене.
-#define NETWORK_MAP_CACHE_PATH     "data/server_map.dat"
-#define NETWORK_MAP_HOST_PATH      "data/custom.dat"
-#define NETWORK_MAP_DEDICATED_PATH "map/custom.dat"
+#define NETWORK_MAP_CACHE_PATH     "server_map.dat"
+#define NETWORK_MAP_HOST_PATH      "custom.dat"
+#define NETWORK_MAP_DEDICATED_PATH "custom.dat"
 
 bool Network_LoadMapFile(const char *path);
 const char *Network_MapCachePath(void);

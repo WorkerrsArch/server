@@ -7,9 +7,9 @@ RUN gcc -O2 -DNETWORK_HEADLESS_BUILD -o server server_main.c network.c -lm
 FROM debian:bookworm-slim
 WORKDIR /app
 COPY --from=build /app/server ./server
+# Карта: custom.dat рядом с server (из редактора: S → custom.dat)
+COPY custom.dat ./custom.dat
 
-# Внутренний порт сервера. Должен совпадать с "Internal Port",
-# который вы укажете при включении TCP Proxy в настройках сервиса Railway.
 ENV PORT=50000
 EXPOSE 50000
 
