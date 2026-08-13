@@ -244,11 +244,18 @@ static bool SendAll(SOCKET s, const void *data, size_t len) {
         int n = send(s, p + sent, (int)(len - sent), 0);
         if (n > 0) { sent += (size_t)n; continue; }
 #ifdef _WIN32
-        if (n == SOCKET_ERROR && WSAGetLastError() == WSAEWOULDBLOCK) continue;
+        if (n == SOCKET_ERROR && WSAGetLastError() == WSAEWOULDBLOCK) {
+            Sleep(1);
+            continue;
+        }
 #else
-        if (n < 0 && (errno == EWOULDBLOCK || errno == EAGAIN)) continue;
+        if (n < 0 && (errno == EWOULDBLOCK || errno == EAGAIN)) {
+            struct timespec ts = {0, 1000 * 1000};
+            nanosleep(&ts, NULL);
+            continue;
+        }
 #endif
-        return false; // реальный разрыв соединения / ошибка сокета
+        return false;
     }
     return true;
 }
@@ -455,6 +462,14 @@ static void SendMapChunks(SOCKET s) {
             return;
         }
         offset += chunk;
+        if ((offset / MAP_CHUNK_PAYLOAD) % 8 == 0) {
+#ifdef _WIN32
+            Sleep(1);
+#else
+            struct timespec ts = {0, 500 * 1000};
+            nanosleep(&ts, NULL);
+#endif
+        }
     }
     printf("Map fully sent (%u bytes)\n", mapFileSize);
 }
