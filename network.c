@@ -172,6 +172,7 @@ static SOCKET clientSockets[MAX_PLAYERS];
 static PlayerState clientStates[MAX_PLAYERS];
 static bool clientConnected[MAX_PLAYERS];
 static double clientLastSeen[MAX_PLAYERS];
+static bool clientMapTransferring[MAX_PLAYERS];
 static char clientRecvBuf[MAX_PLAYERS][RECV_STREAM_BUF];
 static int clientRecvLen[MAX_PLAYERS];
 static int clientCount = 0;
@@ -743,6 +744,7 @@ static void ClearClientSlot(int i) {
         clientSockets[i] = INVALID_SOCKET;
     }
     clientConnected[i] = false;
+    clientMapTransferring[i] = false;
     clientStates[i] = (PlayerState){0};
     clientRecvLen[i] = 0;
     rosterDirty = true;
@@ -752,7 +754,8 @@ static void ServerCheckTimeouts(void) {
     double now = Net_Now();
     int base = hostPlaysToo ? 1 : 0;
     for (int i = base; i < clientCount; i++) {
-        if (clientConnected[i] && now - clientLastSeen[i] > CLIENT_TIMEOUT) {
+        if (!clientConnected[i] || clientMapTransferring[i]) continue;
+        if (now - clientLastSeen[i] > CLIENT_TIMEOUT) {
             printf("Client %d timed out, disconnecting\n", i);
             ClearClientSlot(i);
         }
@@ -896,8 +899,6 @@ bool Network_ReceiveSnapshot(GameSnapshot *snap) {
                 if ((type == MSG_HELLO || type == MSG_STATE) && len == sizeof(PlayerState)) {
                     PlayerState newState;
                     memcpy(&newState, payload, sizeof(newState));
-                    // Та же логика: не даём клиенту затирать серверный урон
-                    // собственным "неповреждённым" отчётом, кроме респауна.
                     bool respawn = newState.alive && !clientStates[i].alive;
                     float authHealth = clientStates[i].health;
                     bool authAlive = clientStates[i].alive;
@@ -906,24 +907,26 @@ bool Network_ReceiveSnapshot(GameSnapshot *snap) {
                         clientStates[i].health = authHealth;
                         clientStates[i].alive = authAlive;
                     }
+                    clientMapTransferring[i] = false;
                     gotAny = true;
                 } else if (type == MSG_HITEVENT && len == sizeof(HitEvent)) {
                     HitEvent event;
                     memcpy(&event, payload, sizeof(event));
-                    // shooterId не доверяем содержимому пакета - берём реальный
-                    // слот соединения, с которого он пришёл (раньше, на UDP,
-                    // клиент сам подставлял свой id, что легко подделать).
                     event.shooterId = i;
                     ResolveHitEvent(event);
                     gotAny = true;
                 } else if (type == MSG_PING && len == 8) {
-                    // Эхо 8 байт timestamp — клиент сам считает RTT.
                     SendFramed(cs, MSG_PONG, payload, len);
                 } else if (type == MSG_MAP_NEED) {
                     printf("Client %d requested map download\n", i);
+                    clientMapTransferring[i] = true;
+                    clientLastSeen[i] = Net_Now();
                     SendMapChunks(cs);
+                    clientLastSeen[i] = Net_Now();
                 } else if (type == MSG_MAP_HAVE) {
                     printf("Client %d has matching map cache\n", i);
+                    clientMapTransferring[i] = false;
+                    clientLastSeen[i] = Net_Now();
                 }
             }
         }
