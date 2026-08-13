@@ -57,7 +57,7 @@ typedef enum {
 
 #define RECV_STREAM_BUF 16384
 #define MAP_CHUNK_PAYLOAD 4096
-#define MAP_MAX_BYTES (4 * 1024 * 1024)
+#define MAP_MAX_BYTES (24 * 5012 * 5012)
 
 bool isServer = false;
 static int myId = -1;
