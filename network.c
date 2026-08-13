@@ -57,7 +57,7 @@ typedef enum {
 
 #define RECV_STREAM_BUF 16384
 #define MAP_CHUNK_PAYLOAD 4096
-#define MAP_MAX_BYTES (24 * 5012 * 5012)
+#define MAP_MAX_BYTES (32 * 1024 * 1024)  // до 32 МБ (custom.dat ~17 МБ ок)
 
 bool isServer = false;
 static int myId = -1;
@@ -553,11 +553,6 @@ static bool ClientSyncMap(void) {
         free(buf);
         return false;
     }
-#ifdef _WIN32
-    _mkdir("data");
-#else
-    mkdir("data", 0755);
-#endif
     FILE *out = fopen(NETWORK_MAP_CACHE_PATH, "wb");
     if (!out) { free(buf); return false; }
     fwrite(buf, 1, remoteSize, out);
@@ -906,8 +901,8 @@ bool Network_ReceiveSnapshot(GameSnapshot *snap) {
                     event.shooterId = i;
                     ResolveHitEvent(event);
                     gotAny = true;
-                } else if (type == MSG_PING && len == sizeof(double)) {
-                    // Просто эхо тем же payload'ом - клиент сам посчитает RTT.
+                } else if (type == MSG_PING && len == 8) {
+                    // Эхо 8 байт timestamp — клиент сам считает RTT.
                     SendFramed(cs, MSG_PONG, payload, len);
                 } else if (type == MSG_MAP_NEED) {
                     printf("Client %d requested map download\n", i);
