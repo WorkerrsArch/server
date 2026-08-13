@@ -70,9 +70,9 @@ static uint32_t mapFileCrc = 0;
 
 // Сетка блоков для серверного raycast (анти-wallhack).
 // Размеры совпадают с world.h (WORLD_X/Y/Z). Порядок в файле: x, z, y.
-#define SRV_WX 100
-#define SRV_WY 99
-#define SRV_WZ 100
+#define SRV_WX 350
+#define SRV_WY 150
+#define SRV_WZ 350
 #define SRV_AIR ((signed char)-1)
 static signed char *srvBlocks = NULL;
 static int srvMapReady = 0;
