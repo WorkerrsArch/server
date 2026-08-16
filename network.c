@@ -788,19 +788,24 @@ static void ResolveHitEvent(HitEvent event) {
     // Стена по серверной карте. Если карты нет — occlusion выключен.
     float wallDist = ServerBlockRaycast(event.origin, event.direction, HITSCAN_RANGE);
 
+    // Один хитбокс на всю модель: центр торса, радиус ~половина роста.
+    const float kEyeH = 1.65f;
+    const float kPlayerH = 1.8f;
+    const float kRadius = kPlayerH * 0.5f;
+
     float bestDist = HITSCAN_RANGE;
     int bestTarget = -1;
     for (int i = 0; i < clientCount; i++) {
         if (i == event.shooterId || !clientConnected[i] || !clientStates[i].alive) continue;
-        Vector3 targetPos = clientStates[i].position;
-        Vector3 oc = Vector3Subtract(event.origin, targetPos);
+        Vector3 eye = clientStates[i].position;
+        Vector3 center = { eye.x, eye.y - kEyeH + kPlayerH * 0.5f, eye.z };
+        Vector3 oc = Vector3Subtract(event.origin, center);
         float b = Vector3DotProduct(oc, event.direction);
-        float c = Vector3DotProduct(oc, oc) - 0.25f; // радиус ~0.5 (глаза/торс)
+        float c = Vector3DotProduct(oc, oc) - kRadius * kRadius;
         float disc = b * b - c;
         if (disc < 0) continue;
         float t = -b - sqrtf(disc);
         if (t < 0) t = -b + sqrtf(disc);
-        // Попадание только если игрок ближе стены (анти-wallhack).
         if (t > 0.0f && t < bestDist && t < wallDist) {
             bestDist = t;
             bestTarget = i;
@@ -810,8 +815,14 @@ static void ResolveHitEvent(HitEvent event) {
     HitConfirm confirm;
     confirm.shooterId = event.shooterId;
     if (bestTarget != -1) {
-        int damage = (event.weaponType == 0) ? 25 : 35;
-        if (event.headshot) damage = (int)(damage * 2.5f);
+        float base = (event.weaponType == 0) ? 25.0f : 35.0f;
+        float mul;
+        if (bestDist < 5.0f)       mul = 1.20f;
+        else if (bestDist < 18.0f) mul = 1.00f;
+        else if (bestDist < 45.0f) mul = 1.00f - (bestDist - 18.0f) / 27.0f * 0.55f;
+        else                       mul = 0.40f;
+        int damage = (int)(base * mul + 0.5f);
+        if (damage < 1) damage = 1;
         clientStates[bestTarget].health -= damage;
         if (clientStates[bestTarget].health <= 0) {
             clientStates[bestTarget].alive = false;
