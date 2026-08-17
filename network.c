@@ -725,12 +725,8 @@ bool Network_InitDedicatedServer(int port) {
     hostPlaysToo = false;
     myId = -1;      // у dedicated-сервера нет своего игрока
     clientCount = 0;
-    // Боевая карта для raycast/раздачи. wait_map.dat клиент грузит локально в WAITING.
-    if (!Network_LoadMapFile(NETWORK_MAP_DEDICATED_PATH)) {
-        printf("WARN: %s not found — clients use default arena\n", NETWORK_MAP_DEDICATED_PATH);
-    }
-    printf("Dedicated TCP server started on port %d (match 4v4, wait %.0fs, win %d)\n",
-           port, MATCH_WAIT_SEC, MATCH_SCORE_WIN);
+    Network_LoadMapFile(NETWORK_MAP_DEDICATED_PATH);
+    printf("Dedicated TCP server started on port %d\n", port);
     return true;
 }
 
@@ -933,6 +929,8 @@ static void ResolveHitEvent(HitEvent event) {
     int bestTarget = -1;
     for (int i = 0; i < clientCount; i++) {
         if (i == event.shooterId || !clientConnected[i] || !clientStates[i].alive) continue;
+        /* friendly fire OFF */
+        if (clientStates[i].faction == clientStates[event.shooterId].faction) continue;
         Vector3 eye = clientStates[i].position;
         Vector3 center = { eye.x, eye.y - kEyeH + kPlayerH * 0.5f, eye.z };
         Vector3 oc = Vector3Subtract(event.origin, center);
