@@ -13,12 +13,25 @@
     #include "raylib.h"
 #endif
 
-#define MAX_PLAYERS 4
+#define MAX_PLAYERS 8              // 4v4
 #define SERVER_PORT 50000          // порт по умолчанию (он же "Internal Port" в Railway TCP Proxy)
-#define BUFFER_SIZE 2048
+#define BUFFER_SIZE 4096
 #define CLIENT_TIMEOUT 5.0f
 #define MAX_PACKETS_PER_TICK 64
 #define HITSCAN_RANGE 100.0f       // единая дальность хитскана для клиента и сервера
+
+#define MATCH_SCORE_WIN      150
+#define MATCH_ROUND_SEC      300.0f
+#define MATCH_WAIT_SEC       22.0f
+#define MATCH_PTS_KILL       15
+#define MATCH_PTS_DAMAGE_DIV 5
+
+typedef enum {
+    MATCH_WAITING   = 0,
+    MATCH_COUNTDOWN = 1,
+    MATCH_PLAYING   = 2,
+    MATCH_ENDED     = 3
+} MatchPhase;
 
 typedef struct {
     Vector3 position;
@@ -29,12 +42,16 @@ typedef struct {
     float health;
     bool alive;
     int faction;
-    float speed;              // <-- обязательно должно быть здесь
+    float speed;
 } PlayerState;
 
 typedef struct {
     PlayerState players[MAX_PLAYERS];
     int playerCount;
+    int matchPhase;
+    int scoreShield;
+    int scoreVolya;
+    float timeLeft;
 } GameSnapshot;
 
 typedef struct {
@@ -73,6 +90,9 @@ void Network_BroadcastHitConfirm(HitConfirm confirm);
 bool Network_ReceiveHitConfirm(HitConfirm *confirm);
 void Network_Close(void);
 int  Network_GetMyId(void);
+float Network_GetPing(void);
+void Network_SeedPing(float ms); // начальный пинг из probe списка серверов
+bool Network_ProbeServer(const char *addr, int timeoutMs, float *outPingMs);
 
 // Хост не проходит обычный цикл "отправил по сети -> получил из сокета",
 // поэтому свои же попадания и свой же авторитетный health/alive
@@ -93,8 +113,15 @@ bool Network_InitDedicatedServer(int port);
 #define NETWORK_MAP_CACHE_PATH     "server_map.dat"
 #define NETWORK_MAP_HOST_PATH      "custom.dat"
 #define NETWORK_MAP_DEDICATED_PATH "custom.dat"
+#define NETWORK_MAP_WAIT_PATH      "wait_map.dat"
 
 bool Network_LoadMapFile(const char *path);
 const char *Network_MapCachePath(void);
 uint32_t Network_MapCrc(void);
 uint32_t Network_MapSize(void);
+
+// Клиент: последняя фаза матча из snapshot
+int   Network_GetMatchPhase(void);
+int   Network_GetScoreShield(void);
+int   Network_GetScoreVolya(void);
+float Network_GetMatchTimeLeft(void);
