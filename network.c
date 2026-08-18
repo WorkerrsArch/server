@@ -63,21 +63,6 @@ bool isServer = false;
 static int myId = -1;
 static bool hostPlaysToo = true; // false для настоящего dedicated-сервера (server_main.c)
 
-// ---- матч ----
-static int   matchPhase = MATCH_WAITING;
-static int   scoreShield = 0, scoreVolya = 0;
-static float matchTimeLeft = 0.0f;
-static double matchLastTick = 0.0;
-static int   clientMatchPhase = MATCH_WAITING;
-static int   clientScoreShield = 0, clientScoreVolya = 0;
-static float clientTimeLeft = 0.0f;
-
-static void MatchTick(void); // body after Net_Now / clientCount
-int Network_GetMatchPhase(void) { return isServer ? matchPhase : clientMatchPhase; }
-int Network_GetScoreShield(void) { return isServer ? scoreShield : clientScoreShield; }
-int Network_GetScoreVolya(void) { return isServer ? scoreVolya : clientScoreVolya; }
-float Network_GetMatchTimeLeft(void) { return isServer ? matchTimeLeft : clientTimeLeft; }
-
 // ---- карта для раздачи ----
 static unsigned char *mapFileData = NULL;
 static uint32_t mapFileSize = 0;
@@ -187,7 +172,7 @@ static SOCKET clientSockets[MAX_PLAYERS];
 static PlayerState clientStates[MAX_PLAYERS];
 static bool clientConnected[MAX_PLAYERS];
 static double clientLastSeen[MAX_PLAYERS];
-static bool clientMapTransferring[MAX_PLAYERS]; // true пока шлём/ждём карту — не кикать по таймауту
+static bool clientMapTransferring[MAX_PLAYERS];
 static char clientRecvBuf[MAX_PLAYERS][RECV_STREAM_BUF];
 static int clientRecvLen[MAX_PLAYERS];
 static int clientCount = 0;
@@ -206,8 +191,6 @@ static int pendingConfirmCount = 0;
 static double lastPingSentAt = 0.0;
 static bool pingWaiting = false;
 static float currentPingMs = 0.0f;
-static double lastStateSentAt = 0.0; // fallback STATE→SNAPSHOT
-static int pongCount = 0;
 
 static bool InitSockets(void) {
 #ifdef _WIN32
@@ -229,57 +212,6 @@ static double Net_Now(void) {
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
 #endif
-}
-
-static int CountConnectedPlayers(void) {
-    int n = 0;
-    for (int i = 0; i < clientCount; i++)
-        if (clientConnected[i]) n++;
-    return n;
-}
-static void MatchResetScores(void) { scoreShield = 0; scoreVolya = 0; }
-static void MatchStartPlaying(void) {
-    matchPhase = MATCH_PLAYING;
-    matchTimeLeft = MATCH_ROUND_SEC;
-    MatchResetScores();
-    for (int i = 0; i < clientCount; i++) {
-        if (!clientConnected[i]) continue;
-        clientStates[i].health = 100.0f;
-        clientStates[i].alive = true;
-    }
-    printf("Match: PLAYING\n");
-}
-static void MatchTick(void) {
-    double now = Net_Now();
-    float dt = (matchLastTick > 0.0) ? (float)(now - matchLastTick) : 0.0f;
-    if (dt < 0.f) dt = 0.f;
-    if (dt > 0.25f) dt = 0.25f;
-    matchLastTick = now;
-    int n = CountConnectedPlayers();
-    if (matchPhase == MATCH_WAITING) {
-        matchTimeLeft = 0.f;
-        if (n >= 2) { matchPhase = MATCH_COUNTDOWN; matchTimeLeft = MATCH_WAIT_SEC; }
-    } else if (matchPhase == MATCH_COUNTDOWN) {
-        if (n < 2) { matchPhase = MATCH_WAITING; matchTimeLeft = 0.f; }
-        else {
-            matchTimeLeft -= dt;
-            if (matchTimeLeft <= 0.f) MatchStartPlaying();
-        }
-    } else if (matchPhase == MATCH_PLAYING) {
-        matchTimeLeft -= dt;
-        if (scoreShield >= MATCH_SCORE_WIN || scoreVolya >= MATCH_SCORE_WIN || matchTimeLeft <= 0.f) {
-            matchPhase = MATCH_ENDED;
-            matchTimeLeft = 0.f;
-        }
-    } else if (matchPhase == MATCH_ENDED) {
-        static float endHold = 0.f;
-        endHold += dt;
-        if (endHold > 12.f) {
-            endHold = 0.f;
-            matchPhase = MATCH_WAITING;
-            MatchResetScores();
-        }
-    }
 }
 
 static void SetNonBlocking(SOCKET s) {
@@ -314,17 +246,17 @@ static bool SendAll(SOCKET s, const void *data, size_t len) {
         if (n > 0) { sent += (size_t)n; continue; }
 #ifdef _WIN32
         if (n == SOCKET_ERROR && WSAGetLastError() == WSAEWOULDBLOCK) {
-            Sleep(1); // не крутим CPU — ждём пока TCP-буфер освободится
+            Sleep(1);
             continue;
         }
 #else
         if (n < 0 && (errno == EWOULDBLOCK || errno == EAGAIN)) {
-            struct timespec ts = {0, 1000 * 1000}; // 1 мс
+            struct timespec ts = {0, 1000 * 1000};
             nanosleep(&ts, NULL);
             continue;
         }
 #endif
-        return false; // реальный разрыв соединения / ошибка сокета
+        return false;
     }
     return true;
 }
@@ -519,8 +451,6 @@ static void SendMapInfo(SOCKET s) {
 static void SendMapChunks(SOCKET s) {
     if (!mapFileData || mapFileSize == 0) return;
     uint32_t offset = 0;
-    // Шлём чанками и чуть дышим между пачками — иначе Railway TCP Proxy
-    // и неблокирующий сокет могут оборвать поток на 18 МБ.
     while (offset < mapFileSize) {
         uint32_t chunk = mapFileSize - offset;
         if (chunk > MAP_CHUNK_PAYLOAD) chunk = MAP_CHUNK_PAYLOAD;
@@ -537,7 +467,7 @@ static void SendMapChunks(SOCKET s) {
 #ifdef _WIN32
             Sleep(1);
 #else
-            struct timespec ts = {0, 500 * 1000}; // 0.5 мс
+            struct timespec ts = {0, 500 * 1000};
             nanosleep(&ts, NULL);
 #endif
         }
@@ -599,24 +529,11 @@ static bool ClientSyncMap(void) {
     SendFramed(sock, MSG_MAP_NEED, NULL, 0);
 
     unsigned char *buf = (unsigned char *)malloc(remoteSize);
-    if (!buf) {
-        printf("Map download: out of memory (%u bytes)\n", remoteSize);
-        return false;
-    }
-    // Таймаут: минимум 3 мин + ~30с на каждый МБ (Railway TCP бывает медленный)
-    double timeoutSec = 180.0 + (double)remoteSize / (1024.0 * 1024.0) * 30.0;
-    if (timeoutSec > 900.0) timeoutSec = 900.0;
-    deadline = Net_Now() + timeoutSec;
+    if (!buf) return false;
     uint32_t received = 0;
-    double lastUi = 0.0;
-    double lastLog = 0.0;
-
+    deadline = Net_Now() + 60.0;
     while (received < remoteSize && Net_Now() < deadline) {
-        if (!PumpRecv(sock, recvStreamBuf, &recvStreamLen)) {
-            printf("Map download: connection lost at %u/%u\n", received, remoteSize);
-            free(buf);
-            return false;
-        }
+        if (!PumpRecv(sock, recvStreamBuf, &recvStreamLen)) { free(buf); return false; }
         for (;;) {
             uint32_t type, len;
             char payload[RECV_STREAM_BUF];
@@ -628,71 +545,27 @@ static bool ClientSyncMap(void) {
                 uint32_t dataLen = len - 8;
                 if (total != remoteSize || offset + dataLen > remoteSize) continue;
                 memcpy(buf + offset, payload + 8, dataLen);
-                // Чанки идут по порядку — high-water = сколько байт подряд с начала
-                if (offset <= received && offset + dataLen > received)
-                    received = offset + dataLen;
-                else if (offset + dataLen > received && offset == received)
-                    received = offset + dataLen;
-                else if (offset + dataLen > received)
-                    received = offset + dataLen; // fallback if reordered
+                if (offset + dataLen > received) received = offset + dataLen;
             } else if (type == MSG_WELCOME && len == sizeof(WelcomeMsg)) {
                 WelcomeMsg w; memcpy(&w, payload, sizeof(w));
                 myId = w.assignedId;
             }
         }
-
-        double now = Net_Now();
-#ifndef NETWORK_HEADLESS_BUILD
-        // Экран загрузки ~15 раз/сек. Кириллица — через uiFont (у default-шрифта raylib её нет → "????").
-        if (now - lastUi > 0.066) {
-            lastUi = now;
-            float pct = remoteSize ? (100.0f * (float)received / (float)remoteSize) : 0.0f;
-            int sw = GetScreenWidth(), sh = GetScreenHeight();
-            extern Font uiFont;
-            BeginDrawing();
-            ClearBackground((Color){12, 14, 18, 255});
-            const char *title = "Загрузка карты с сервера...";
-            Vector2 ts = MeasureTextEx(uiFont, title, 28, 1);
-            DrawTextEx(uiFont, title, (Vector2){sw/2 - ts.x/2, (float)(sh/2 - 60)}, 28, 1, WHITE);
-            char line[128];
-            snprintf(line, sizeof(line), "%.1f / %.1f MB  (%.0f%%)",
-                     received / (1024.0f*1024.0f),
-                     remoteSize / (1024.0f*1024.0f), pct);
-            Vector2 ls = MeasureTextEx(uiFont, line, 20, 1);
-            DrawTextEx(uiFont, line, (Vector2){sw/2 - ls.x/2, (float)(sh/2 - 20)}, 20, 1, LIGHTGRAY);
-            int barW = sw / 2, barH = 18;
-            int bx = sw/2 - barW/2, by = sh/2 + 20;
-            DrawRectangle(bx, by, barW, barH, (Color){40, 40, 50, 255});
-            int fill = (int)(barW * (pct / 100.0f));
-            if (fill > 0) DrawRectangle(bx, by, fill, barH, (Color){80, 180, 120, 255});
-            DrawRectangleLines(bx, by, barW, barH, WHITE);
-            const char *hint = "Не закрывайте игру";
-            Vector2 hs = MeasureTextEx(uiFont, hint, 16, 1);
-            DrawTextEx(uiFont, hint, (Vector2){sw/2 - hs.x/2, (float)(by + 30)}, 16, 1, (Color){180, 180, 180, 255});
-            EndDrawing();
-        }
-#endif
-        if (now - lastLog > 2.0) {
-            lastLog = now;
-            printf("Map download progress: %u / %u (%.0f%%)\n",
-                   received, remoteSize,
-                   remoteSize ? 100.0 * received / remoteSize : 0.0);
-        }
 #ifdef _WIN32
-        Sleep(1);
+        Sleep(5);
 #else
-        struct timespec ts = {0, 1 * 1000 * 1000};
+        struct timespec ts = {0, 5 * 1000 * 1000};
         nanosleep(&ts, NULL);
 #endif
     }
     if (received < remoteSize) {
-        printf("Map download incomplete (%u/%u) — timeout or stall\n", received, remoteSize);
+        printf("Map download incomplete (%u/%u)\n", received, remoteSize);
         free(buf);
         return false;
     }
     uint32_t gotCrc = Crc32FileBuffer(buf, remoteSize);
     if (gotCrc != remoteCrc) {
-        printf("Map CRC mismatch after download (got 0x%08X, want 0x%08X)\n", gotCrc, remoteCrc);
+        printf("Map CRC mismatch after download\n");
         free(buf);
         return false;
     }
@@ -702,8 +575,6 @@ static bool ClientSyncMap(void) {
     fclose(out);
     free(buf);
     printf("Map saved to %s\n", NETWORK_MAP_CACHE_PATH);
-    // Сообщаем серверу, что карта на месте — снимет clientMapTransferring
-    SendFramed(sock, MSG_MAP_HAVE, NULL, 0);
     return true;
 }
 
@@ -855,7 +726,6 @@ void Network_SendState(PlayerState state) {
         }
     } else {
         if (sock == INVALID_SOCKET) return;
-        lastStateSentAt = Net_Now();
         SendFramed(sock, MSG_STATE, &state, sizeof(state));
     }
 }
@@ -884,8 +754,6 @@ static void ServerCheckTimeouts(void) {
     double now = Net_Now();
     int base = hostPlaysToo ? 1 : 0;
     for (int i = base; i < clientCount; i++) {
-        // Пока клиент качает карту (~18 МБ), STATE не шлёт — таймаут 5с убивал
-        // соединение на последних килобайтах (см. "connection lost at 18370560/...").
         if (!clientConnected[i] || clientMapTransferring[i]) continue;
         if (now - clientLastSeen[i] > CLIENT_TIMEOUT) {
             printf("Client %d timed out, disconnecting\n", i);
@@ -920,17 +788,15 @@ static void ResolveHitEvent(HitEvent event) {
     // Стена по серверной карте. Если карты нет — occlusion выключен.
     float wallDist = ServerBlockRaycast(event.origin, event.direction, HITSCAN_RANGE);
 
-    // Один хитбокс на всю модель (как на клиенте): центр торса, радиус ~половина роста.
+    // Один хитбокс на всю модель: центр торса, радиус ~половина роста.
     const float kEyeH = 1.65f;
     const float kPlayerH = 1.8f;
-    const float kRadius = kPlayerH * 0.5f; // ~0.9 — покрывает ноги→голову
+    const float kRadius = kPlayerH * 0.5f;
 
     float bestDist = HITSCAN_RANGE;
     int bestTarget = -1;
     for (int i = 0; i < clientCount; i++) {
         if (i == event.shooterId || !clientConnected[i] || !clientStates[i].alive) continue;
-        /* friendly fire OFF */
-        if (clientStates[i].faction == clientStates[event.shooterId].faction) continue;
         Vector3 eye = clientStates[i].position;
         Vector3 center = { eye.x, eye.y - kEyeH + kPlayerH * 0.5f, eye.z };
         Vector3 oc = Vector3Subtract(event.origin, center);
@@ -949,7 +815,6 @@ static void ResolveHitEvent(HitEvent event) {
     HitConfirm confirm;
     confirm.shooterId = event.shooterId;
     if (bestTarget != -1) {
-        // Базовый урон оружия + спад с дистанцией (как на клиенте)
         float base = (event.weaponType == 0) ? 25.0f : 35.0f;
         float mul;
         if (bestDist < 5.0f)       mul = 1.20f;
@@ -958,33 +823,10 @@ static void ResolveHitEvent(HitEvent event) {
         else                       mul = 0.40f;
         int damage = (int)(base * mul + 0.5f);
         if (damage < 1) damage = 1;
-        // Если клиент прислал свой расчёт — слегка учитываем, но авторитет у сервера
-        if (event.damage > 0.0f) {
-            int fromClient = (int)(event.damage + 0.5f);
-            if (fromClient < 1) fromClient = 1;
-            // Берём серверный falloff (защита от читов), клиентский только как подсказка
-            (void)fromClient;
-        }
-        // Очки только в PLAYING
-        if (matchPhase == MATCH_PLAYING) {
-            int pts = damage / MATCH_PTS_DAMAGE_DIV;
-            if (pts < 1) pts = 1;
-            int sf = clientStates[event.shooterId].faction;
-            if (sf == 0) scoreShield += pts; else scoreVolya += pts;
-        }
         clientStates[bestTarget].health -= damage;
         if (clientStates[bestTarget].health <= 0) {
             clientStates[bestTarget].alive = false;
             clientStates[bestTarget].health = 0;
-            if (matchPhase == MATCH_PLAYING) {
-                int sf = clientStates[event.shooterId].faction;
-                if (sf == 0) scoreShield += MATCH_PTS_KILL; else scoreVolya += MATCH_PTS_KILL;
-            }
-            // В WAITING/COUNTDOWN — мгновенный респаун на сервере
-            if (matchPhase == MATCH_WAITING || matchPhase == MATCH_COUNTDOWN) {
-                clientStates[bestTarget].health = 100.0f;
-                clientStates[bestTarget].alive = true;
-            }
         }
         confirm.targetId = bestTarget;
         confirm.damage = damage;
@@ -1068,8 +910,6 @@ bool Network_ReceiveSnapshot(GameSnapshot *snap) {
                 if ((type == MSG_HELLO || type == MSG_STATE) && len == sizeof(PlayerState)) {
                     PlayerState newState;
                     memcpy(&newState, payload, sizeof(newState));
-                    // Та же логика: не даём клиенту затирать серверный урон
-                    // собственным "неповреждённым" отчётом, кроме респауна.
                     bool respawn = newState.alive && !clientStates[i].alive;
                     float authHealth = clientStates[i].health;
                     bool authAlive = clientStates[i].alive;
@@ -1078,19 +918,15 @@ bool Network_ReceiveSnapshot(GameSnapshot *snap) {
                         clientStates[i].health = authHealth;
                         clientStates[i].alive = authAlive;
                     }
-                    clientMapTransferring[i] = false; // уже в игре — карта синкнута
+                    clientMapTransferring[i] = false;
                     gotAny = true;
                 } else if (type == MSG_HITEVENT && len == sizeof(HitEvent)) {
                     HitEvent event;
                     memcpy(&event, payload, sizeof(event));
-                    // shooterId не доверяем содержимому пакета - берём реальный
-                    // слот соединения, с которого он пришёл (раньше, на UDP,
-                    // клиент сам подставлял свой id, что легко подделать).
                     event.shooterId = i;
                     ResolveHitEvent(event);
                     gotAny = true;
                 } else if (type == MSG_PING && len == 8) {
-                    // Эхо 8 байт timestamp (uint64 ms) — клиент сам считает RTT.
                     SendFramed(cs, MSG_PONG, payload, len);
                 } else if (type == MSG_MAP_NEED) {
                     printf("Client %d requested map download\n", i);
@@ -1098,7 +934,6 @@ bool Network_ReceiveSnapshot(GameSnapshot *snap) {
                     clientLastSeen[i] = Net_Now();
                     SendMapChunks(cs);
                     clientLastSeen[i] = Net_Now();
-                    // Флаг снимем по MSG_MAP_HAVE или первому STATE
                 } else if (type == MSG_MAP_HAVE) {
                     printf("Client %d has matching map cache\n", i);
                     clientMapTransferring[i] = false;
@@ -1108,16 +943,11 @@ bool Network_ReceiveSnapshot(GameSnapshot *snap) {
         }
 
         ServerCheckTimeouts();
-        MatchTick();
         snap->playerCount = clientCount;
         memcpy(snap->players, clientStates, sizeof(PlayerState) * clientCount);
-        snap->matchPhase = matchPhase;
-        snap->scoreShield = scoreShield;
-        snap->scoreVolya = scoreVolya;
-        snap->timeLeft = matchTimeLeft;
         // Обязательно вернуть true при смене состава, иначе disconnect
         // не дойдёт до клиентов и моделька «зависнет» на месте выхода.
-        bool dirty = gotAny || rosterDirty || true; // матч-таймер всегда тикает
+        bool dirty = gotAny || rosterDirty;
         rosterDirty = false;
         return dirty;
 
@@ -1139,53 +969,25 @@ bool Network_ReceiveSnapshot(GameSnapshot *snap) {
                 myId = w.assignedId;
             } else if (type == MSG_SNAPSHOT && len == sizeof(GameSnapshot)) {
                 memcpy(snap, payload, sizeof(GameSnapshot));
-                clientMatchPhase = snap->matchPhase;
-                clientScoreShield = snap->scoreShield;
-                clientScoreVolya = snap->scoreVolya;
-                clientTimeLeft = snap->timeLeft;
                 got = true;
             } else if (type == MSG_HITCONFIRM && len == sizeof(HitConfirm)) {
                 if (pendingConfirmCount < MAX_PACKETS_PER_TICK) {
                     memcpy(&pendingConfirms[pendingConfirmCount++], payload, sizeof(HitConfirm));
                 }
-            } else if (type == MSG_PONG && len >= 8) {
-                // payload = uint64_t миллисекунды (монотонные)
-                uint64_t sentMs = 0;
-                memcpy(&sentMs, payload, 8);
-                double nowMs = Net_Now() * 1000.0;
-                float rtt = (float)(nowMs - (double)sentMs);
-                if (rtt < 0.0f) rtt = 0.0f;
-                if (rtt > 60000.0f) rtt = 60000.0f;
-                currentPingMs = rtt;
+            } else if (type == MSG_PONG && len == sizeof(double)) {
+                double sentAt;
+                memcpy(&sentAt, payload, sizeof(sentAt));
+                currentPingMs = (float)((Net_Now() - sentAt) * 1000.0);
                 pingWaiting = false;
-                if (pongCount++ < 3)
-                    printf("Pong RTT=%.1f ms\n", rtt);
             }
         }
 
-        // Fallback / уточнение: STATE→SNAPSHOT (работает даже без PONG)
-        if (got && lastStateSentAt > 0.0) {
-            float approx = (float)((Net_Now() - lastStateSentAt) * 1000.0);
-            if (approx >= 0.0f && approx < 60000.0f) {
-                if (pongCount == 0) {
-                    // нет PONG — ведём сглаженную оценку
-                    if (currentPingMs <= 1.0f) currentPingMs = approx;
-                    else currentPingMs = currentPingMs * 0.75f + approx * 0.25f;
-                }
-                // если PONG уже есть — его значение приоритетнее, не затираем
-            }
-            lastStateSentAt = 0.0; // один замер на один STATE
-        }
-
-        // RTT до dedicated/listen-сервера. Таймаут 3с — если PONG потерялся,
-        // пробуем снова (не зависаем на pingWaiting навсегда).
+        // Раз в секунду меряем RTT до сервера пинг-понгом поверх уже
+        // открытого TCP-соединения (сам TCP эту информацию не даёт).
         double now = Net_Now();
-        if (pingWaiting && (now - lastPingSentAt) > 3.0) {
-            pingWaiting = false;
-        }
-        if (!pingWaiting && (now - lastPingSentAt) > 1.0) {
-            uint64_t sentMs = (uint64_t)(now * 1000.0);
-            if (SendFramed(sock, MSG_PING, &sentMs, 8)) {
+        if (!pingWaiting && now - lastPingSentAt > 1.0) {
+            double sentAt = now;
+            if (SendFramed(sock, MSG_PING, &sentAt, sizeof(sentAt))) {
                 lastPingSentAt = now;
                 pingWaiting = true;
             }
@@ -1227,12 +1029,6 @@ int Network_GetMyId(void) { return myId; }
 float Network_GetPing(void) {
     if (isServer) return 0.0f; // хост меряет пинг только относительно себя же - нет смысла
     return currentPingMs;
-}
-
-void Network_SeedPing(float ms) {
-    if (ms < 0.0f) ms = 0.0f;
-    if (ms > 60000.0f) ms = 60000.0f;
-    currentPingMs = ms;
 }
 
 void Network_Close(void) {
