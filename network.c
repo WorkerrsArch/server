@@ -63,6 +63,22 @@ bool isServer = false;
 static int myId = -1;
 static bool hostPlaysToo = true; // false для настоящего dedicated-сервера (server_main.c)
 
+// ---- матч (TDM, синхрон с клиентом) ----
+static int   matchPhase = MATCH_WAITING;
+static int   scoreShield = 0, scoreVolya = 0;
+static float matchTimeLeft = 0.0f;
+static double matchLastTick = 0.0;
+static int   clientMatchPhase = MATCH_WAITING;
+static int   clientScoreShield = 0, clientScoreVolya = 0;
+static float clientTimeLeft = 0.0f;
+
+static void MatchTick(void);
+
+int Network_GetMatchPhase(void) { return isServer ? matchPhase : clientMatchPhase; }
+int Network_GetScoreShield(void) { return isServer ? scoreShield : clientScoreShield; }
+int Network_GetScoreVolya(void) { return isServer ? scoreVolya : clientScoreVolya; }
+float Network_GetMatchTimeLeft(void) { return isServer ? matchTimeLeft : clientTimeLeft; }
+
 // ---- карта для раздачи ----
 static unsigned char *mapFileData = NULL;
 static uint32_t mapFileSize = 0;
@@ -212,6 +228,64 @@ static double Net_Now(void) {
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
 #endif
+}
+
+static int CountConnectedPlayers(void) {
+    int n = 0;
+    for (int i = 0; i < clientCount; i++)
+        if (clientConnected[i]) n++;
+    return n;
+}
+static void MatchResetScores(void) { scoreShield = 0; scoreVolya = 0; }
+static void MatchStartPlaying(void) {
+    matchPhase = MATCH_PLAYING;
+    matchTimeLeft = MATCH_ROUND_SEC;
+    MatchResetScores();
+    for (int i = 0; i < clientCount; i++) {
+        if (!clientConnected[i]) continue;
+        clientStates[i].health = (clientStates[i].faction == 0) ? 110.0f : 100.0f;
+        clientStates[i].alive = true;
+    }
+    printf("Match: PLAYING\n");
+}
+static void MatchTick(void) {
+    double now = Net_Now();
+    float dt = (matchLastTick > 0.0) ? (float)(now - matchLastTick) : 0.0f;
+    if (dt < 0.f) dt = 0.f;
+    if (dt > 0.25f) dt = 0.25f;
+    matchLastTick = now;
+    int n = CountConnectedPlayers();
+    if (matchPhase == MATCH_WAITING) {
+        matchTimeLeft = 0.f;
+        if (n >= 2) { matchPhase = MATCH_COUNTDOWN; matchTimeLeft = MATCH_WAIT_SEC; }
+    } else if (matchPhase == MATCH_COUNTDOWN) {
+        if (n < 2) { matchPhase = MATCH_WAITING; matchTimeLeft = 0.f; }
+        else {
+            matchTimeLeft -= dt;
+            if (matchTimeLeft <= 0.f) MatchStartPlaying();
+        }
+    } else if (matchPhase == MATCH_PLAYING) {
+        matchTimeLeft -= dt;
+        if (scoreShield >= MATCH_SCORE_WIN || scoreVolya >= MATCH_SCORE_WIN || matchTimeLeft <= 0.f) {
+            matchPhase = MATCH_ENDED;
+            matchTimeLeft = 0.f;
+            printf("Match: ENDED (Shield %d / Volya %d)\n", scoreShield, scoreVolya);
+        }
+    } else if (matchPhase == MATCH_ENDED) {
+        static float endHold = 0.f;
+        endHold += dt;
+        if (endHold > MATCH_END_HOLD_SEC) {
+            endHold = 0.f;
+            matchPhase = MATCH_WAITING;
+            MatchResetScores();
+            for (int i = 0; i < clientCount; i++) {
+                if (!clientConnected[i]) continue;
+                clientStates[i].health = (clientStates[i].faction == 0) ? 110.0f : 100.0f;
+                clientStates[i].alive = true;
+            }
+            printf("Match: back to WAITING (next round)\n");
+        }
+    }
 }
 
 static void SetNonBlocking(SOCKET s) {
@@ -797,6 +871,8 @@ static void ResolveHitEvent(HitEvent event) {
     int bestTarget = -1;
     for (int i = 0; i < clientCount; i++) {
         if (i == event.shooterId || !clientConnected[i] || !clientStates[i].alive) continue;
+        /* friendly fire OFF */
+        if (clientStates[i].faction == clientStates[event.shooterId].faction) continue;
         Vector3 eye = clientStates[i].position;
         Vector3 center = { eye.x, eye.y - kEyeH + kPlayerH * 0.5f, eye.z };
         Vector3 oc = Vector3Subtract(event.origin, center);
@@ -821,12 +897,43 @@ static void ResolveHitEvent(HitEvent event) {
         else if (bestDist < 18.0f) mul = 1.00f;
         else if (bestDist < 45.0f) mul = 1.00f - (bestDist - 18.0f) / 27.0f * 0.55f;
         else                       mul = 0.40f;
-        int damage = (int)(base * mul + 0.5f);
+        float dmgF = base * mul;
+        /* Воля в движении: +10% урона */
+        if (clientStates[event.shooterId].faction == 1 &&
+            clientStates[event.shooterId].speed >= 2.5f) {
+            dmgF *= 1.10f;
+        }
+        /* Щит: броня −15% */
+        if (clientStates[bestTarget].faction == 0) {
+            dmgF *= 0.85f;
+        }
+        int damage = (int)(dmgF + 0.5f);
         if (damage < 1) damage = 1;
+
+        if (matchPhase == MATCH_PLAYING) {
+            int pts = damage / MATCH_PTS_DAMAGE_DIV;
+            if (pts < 1) pts = 1;
+            int sf = clientStates[event.shooterId].faction;
+            if (sf == 0) scoreShield += pts; else scoreVolya += pts;
+        }
         clientStates[bestTarget].health -= damage;
+        {
+            float maxHp = (clientStates[bestTarget].faction == 0) ? 110.0f : 100.0f;
+            if (clientStates[bestTarget].health > maxHp)
+                clientStates[bestTarget].health = maxHp;
+        }
         if (clientStates[bestTarget].health <= 0) {
             clientStates[bestTarget].alive = false;
             clientStates[bestTarget].health = 0;
+            if (matchPhase == MATCH_PLAYING) {
+                int sf = clientStates[event.shooterId].faction;
+                if (sf == 0) scoreShield += MATCH_PTS_KILL; else scoreVolya += MATCH_PTS_KILL;
+            }
+            if (matchPhase == MATCH_WAITING || matchPhase == MATCH_COUNTDOWN) {
+                clientStates[bestTarget].health =
+                    (clientStates[bestTarget].faction == 0) ? 110.0f : 100.0f;
+                clientStates[bestTarget].alive = true;
+            }
         }
         confirm.targetId = bestTarget;
         confirm.damage = damage;
@@ -943,11 +1050,17 @@ bool Network_ReceiveSnapshot(GameSnapshot *snap) {
         }
 
         ServerCheckTimeouts();
+        MatchTick();
         snap->playerCount = clientCount;
         memcpy(snap->players, clientStates, sizeof(PlayerState) * clientCount);
+        snap->matchPhase = matchPhase;
+        snap->scoreShield = scoreShield;
+        snap->scoreVolya = scoreVolya;
+        snap->timeLeft = matchTimeLeft;
         // Обязательно вернуть true при смене состава, иначе disconnect
         // не дойдёт до клиентов и моделька «зависнет» на месте выхода.
-        bool dirty = gotAny || rosterDirty;
+        // Матч тикает каждый кадр — всегда шлём snapshot (фаза/счёт/таймер).
+        bool dirty = gotAny || rosterDirty || true;
         rosterDirty = false;
         return dirty;
 
@@ -969,6 +1082,10 @@ bool Network_ReceiveSnapshot(GameSnapshot *snap) {
                 myId = w.assignedId;
             } else if (type == MSG_SNAPSHOT && len == sizeof(GameSnapshot)) {
                 memcpy(snap, payload, sizeof(GameSnapshot));
+                clientMatchPhase = snap->matchPhase;
+                clientScoreShield = snap->scoreShield;
+                clientScoreVolya = snap->scoreVolya;
+                clientTimeLeft = snap->timeLeft;
                 got = true;
             } else if (type == MSG_HITCONFIRM && len == sizeof(HitConfirm)) {
                 if (pendingConfirmCount < MAX_PACKETS_PER_TICK) {
