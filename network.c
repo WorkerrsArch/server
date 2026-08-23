@@ -53,6 +53,7 @@ typedef enum {
     MSG_MAP_NEED   = 10,// клиент -> сервер: нужна полная карта
     MSG_MAP_HAVE   = 11,// клиент -> сервер: локальный кэш совпал по CRC
     MSG_MAP_CHUNK  = 12,// сервер -> клиент: {uint32 offset, uint32 total, data...}
+    MSG_BOTSCORE   = 13,// клиент -> сервер, очки от локального бота,   payload = BotScoreEvent
 } MsgType;
 
 #define RECV_STREAM_BUF 16384
@@ -239,6 +240,18 @@ static int CountConnectedPlayers(void) {
         if (clientConnected[i]) n++;
     return n;
 }
+
+// Очки от локального бота клиента (килл/урон по вражескому боту или
+// по игроку) — доверяем присланному значению points (клиент уже посчитал
+// его по MATCH_PTS_BOT_KILL/MATCH_PTS_BOT_DAMAGE_DIV), но клэмпим сверху
+// на случай мусора/читов в одном сообщении и не считаем очки вне PLAYING.
+static void ApplyBotScore(int faction, int points) {
+    if (matchPhase != MATCH_PLAYING) return;
+    if (points <= 0) return;
+    if (points > MATCH_PTS_KILL) points = MATCH_PTS_KILL; // не больше обычного килла за одно сообщение
+    if (faction == 0) scoreShield += points; else scoreVolya += points;
+}
+
 static void MatchResetScores(void) { scoreShield = 0; scoreVolya = 0; }
 static void MatchStartPlaying(void) {
     matchPhase = MATCH_PLAYING;
@@ -1146,6 +1159,11 @@ bool Network_ReceiveSnapshot(GameSnapshot *snap) {
                     printf("Client %d has matching map cache\n", i);
                     clientMapTransferring[i] = false;
                     clientLastSeen[i] = Net_Now();
+                } else if (type == MSG_BOTSCORE && len == sizeof(BotScoreEvent)) {
+                    BotScoreEvent bse;
+                    memcpy(&bse, payload, sizeof(bse));
+                    ApplyBotScore(bse.faction, bse.points);
+                    gotAny = true;
                 }
             }
         }
@@ -1250,6 +1268,20 @@ void Network_BroadcastSnapshot(GameSnapshot snap) {
 void Network_SendHitEvent(HitEvent event) {
     if (sock == INVALID_SOCKET || isServer) return;
     SendFramed(sock, MSG_HITEVENT, &event, sizeof(event));
+}
+
+void Network_SendBotScore(int faction, int points) {
+    if (points <= 0) return;
+    if (faction != 0 && faction != 1) return;
+    if (isServer) {
+        // Хост сам себе по сокету не отправит (см. Network_HostFire) —
+        // применяем сразу к авторитетному счёту.
+        ApplyBotScore(faction, points);
+    } else {
+        if (sock == INVALID_SOCKET) return;
+        BotScoreEvent bse = { faction, points };
+        SendFramed(sock, MSG_BOTSCORE, &bse, sizeof(bse));
+    }
 }
 
 // Не используется: на UDP сервер разбирал HitEvent прямо внутри

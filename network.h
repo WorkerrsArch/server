@@ -30,6 +30,13 @@
 #define MATCH_PTS_KILL       15
 #define MATCH_PTS_DAMAGE_DIV 5
 
+/* ---- Очки от ботов (сервер тоже это резолвит, честно и одинаково для
+ * всех клиентов) — заметно меньше, чем обычный ПвП-килл/урон выше:
+ * килл ботом = 5 очков (против 15 за обычный килл), урон ботом делится
+ * на больший делитель (15 против 5), т.е. очков за тот же урон меньше в 3 раза. */
+#define MATCH_PTS_BOT_KILL       5
+#define MATCH_PTS_BOT_DAMAGE_DIV 15
+
 typedef enum {
     MATCH_WAITING   = 0,
     MATCH_COUNTDOWN = 1,
@@ -79,6 +86,16 @@ typedef struct {
     int shooterId;
 } HitConfirm;
 
+/* Клиент -> сервер: локальный бот убил/ранил бота вражеской фракции или
+ * локального игрока. points уже посчитаны клиентом по формулам
+ * MATCH_PTS_BOT_KILL / MATCH_PTS_BOT_DAMAGE_DIV — сервер лишь добавляет их
+ * к счёту нужной фракции (см. Network_SendBotScore), так что итоговый счёт
+ * одинаковый у всех, как и обычный счёт по игрокам. */
+typedef struct {
+    int faction; // 0 = Щит, 1 = Воля — фракция бота-стрелка
+    int points;
+} BotScoreEvent;
+
 extern bool isServer;
 
 // Транспорт — TCP (раньше был UDP; сырой UDP Railway не пропускает наружу,
@@ -94,6 +111,10 @@ void Network_SendHitEvent(HitEvent event);
 bool Network_ReceiveHitEvent(HitEvent *event);
 void Network_BroadcastHitConfirm(HitConfirm confirm);
 bool Network_ReceiveHitConfirm(HitConfirm *confirm);
+// Очки за бота: работает и для клиента (шлёт по сети), и для хоста
+// (тот же трюк, что и Network_HostFire — сам себе по сокету не отправишь,
+// поэтому при isServer==true очки применяются к авторитетному счёту напрямую).
+void Network_SendBotScore(int faction, int points);
 void Network_Close(void);
 int  Network_GetMyId(void);
 float Network_GetPing(void);
