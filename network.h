@@ -96,6 +96,37 @@ typedef struct {
     int points;
 } BotScoreEvent;
 
+/* ---- Профили / Топ-100 (жетоны и киллы на сервере) ---- */
+#define PROFILE_NAME_MAX 40
+#define LEADERBOARD_TOP 100
+
+typedef struct {
+    char name[PROFILE_NAME_MAX]; /* «Имя Кличка» UTF-8 */
+} ProfileLoginMsg;
+
+typedef struct {
+    int tokens;
+    int kills;
+    int rank; /* 1..N, 0 если вне топа */
+} ProfileInfoMsg;
+
+typedef struct {
+    char name[PROFILE_NAME_MAX];
+    int kills;
+    int tokens;
+} LeaderboardEntry;
+
+typedef struct {
+    int count;
+    LeaderboardEntry entries[LEADERBOARD_TOP];
+} LeaderboardMsg;
+
+typedef struct {
+    int playerCount;
+    int maxPlayers;
+    int matchPhase;
+} ServerStatusMsg;
+
 extern bool isServer;
 
 // Транспорт — TCP (раньше был UDP; сырой UDP Railway не пропускает наружу,
@@ -120,6 +151,20 @@ int  Network_GetMyId(void);
 float Network_GetPing(void);
 void Network_SeedPing(float ms); // начальный пинг из probe списка серверов
 bool Network_ProbeServer(const char *addr, int timeoutMs, float *outPingMs);
+/* Расширенный probe: пинг + число игроков (если сервер отвечает MSG_STATUS) */
+bool Network_ProbeServerEx(const char *addr, int timeoutMs, float *outPingMs,
+                           int *outPlayerCount, int *outMaxPlayers);
+
+/* Профиль: после коннекта клиент шлёт ник → сервер отвечает tokens/kills/rank */
+void Network_SendProfileLogin(const char *name);
+bool Network_ReceiveProfileInfo(ProfileInfoMsg *out);
+/* Запрос/получение Топ-100 (можно без полного гейм-коннекта через probe-сессию
+ * или после коннекта). Для UI используем кэш последнего ответа. */
+void Network_RequestLeaderboard(void);
+bool Network_ReceiveLeaderboard(LeaderboardMsg *out);
+const LeaderboardMsg *Network_GetCachedLeaderboard(void);
+/* Принудительно подтянуть лидерборд с официального/указанного адреса (короткая TCP-сессия) */
+bool Network_FetchLeaderboard(const char *addr, int timeoutMs, LeaderboardMsg *out);
 
 // Хост не проходит обычный цикл "отправил по сети -> получил из сокета",
 // поэтому свои же попадания и свой же авторитетный health/alive

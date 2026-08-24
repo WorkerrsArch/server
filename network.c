@@ -54,6 +54,12 @@ typedef enum {
     MSG_MAP_HAVE   = 11,// клиент -> сервер: локальный кэш совпал по CRC
     MSG_MAP_CHUNK  = 12,// сервер -> клиент: {uint32 offset, uint32 total, data...}
     MSG_BOTSCORE   = 13,// клиент -> сервер, очки от локального бота,   payload = BotScoreEvent
+    MSG_STATUS_REQ = 14,// probe/клиент -> сервер: запрос статуса
+    MSG_STATUS     = 15,// сервер -> клиент: ServerStatusMsg
+    MSG_PROFILE_LOGIN = 16, // клиент -> сервер: ProfileLoginMsg
+    MSG_PROFILE_INFO  = 17, // сервер -> клиент: ProfileInfoMsg
+    MSG_LB_REQ     = 18, // клиент -> сервер: запрос топ-100
+    MSG_LB_DATA    = 19, // сервер -> клиент: LeaderboardMsg
 } MsgType;
 
 #define RECV_STREAM_BUF 16384
@@ -77,6 +83,133 @@ static void MatchTick(void); // body after Net_Now / clientCount
 int Network_GetMatchPhase(void) { return isServer ? matchPhase : clientMatchPhase; }
 int Network_GetScoreShield(void) { return isServer ? scoreShield : clientScoreShield; }
 int Network_GetScoreVolya(void) { return isServer ? scoreVolya : clientScoreVolya; }
+
+/* ---- Серверные профили (жетоны + киллы) ---- */
+#define PROFILES_PATH "profiles.dat"
+#define PROFILE_MAX_STORE 512
+typedef struct {
+    char name[PROFILE_NAME_MAX];
+    int kills;
+    int tokens;
+} StoredProfile;
+static StoredProfile g_profiles[PROFILE_MAX_STORE];
+static int g_profileCount = 0;
+static bool g_profilesLoaded = false;
+static char clientNames[MAX_PLAYERS][PROFILE_NAME_MAX];
+static int  clientProfileIdx[MAX_PLAYERS]; /* индекс в g_profiles, -1 = нет */
+
+static ProfileInfoMsg pendingProfileInfo;
+static bool hasPendingProfileInfo = false;
+static LeaderboardMsg cachedLeaderboard;
+static bool hasCachedLeaderboard = false;
+
+static int Profile_Find(const char *name) {
+    if (!name || !name[0]) return -1;
+    for (int i = 0; i < g_profileCount; i++) {
+        if (strcmp(g_profiles[i].name, name) == 0) return i;
+    }
+    return -1;
+}
+static void Profile_LoadAll(void) {
+    if (g_profilesLoaded) return;
+    g_profilesLoaded = true;
+    g_profileCount = 0;
+    FILE *f = fopen(PROFILES_PATH, "r");
+    if (!f) return;
+    char line[160];
+    while (fgets(line, sizeof(line), f) && g_profileCount < PROFILE_MAX_STORE) {
+        char name[PROFILE_NAME_MAX];
+        int kills = 0, tokens = 0;
+        /* name|kills|tokens */
+        char *p1 = strchr(line, '|');
+        if (!p1) continue;
+        *p1 = '\0';
+        strncpy(name, line, PROFILE_NAME_MAX - 1);
+        name[PROFILE_NAME_MAX - 1] = '\0';
+        /* trim trailing spaces/CR */
+        for (int i = (int)strlen(name) - 1; i >= 0 && (name[i] == ' ' || name[i] == '\r' || name[i] == '\n'); i--)
+            name[i] = '\0';
+        if (!name[0]) continue;
+        char *p2 = strchr(p1 + 1, '|');
+        kills = atoi(p1 + 1);
+        tokens = p2 ? atoi(p2 + 1) : 0;
+        if (kills < 0) kills = 0;
+        if (tokens < 0) tokens = 0;
+        strncpy(g_profiles[g_profileCount].name, name, PROFILE_NAME_MAX - 1);
+        g_profiles[g_profileCount].kills = kills;
+        g_profiles[g_profileCount].tokens = tokens;
+        g_profileCount++;
+    }
+    fclose(f);
+}
+static void Profile_SaveAll(void) {
+    FILE *f = fopen(PROFILES_PATH, "w");
+    if (!f) return;
+    for (int i = 0; i < g_profileCount; i++)
+        fprintf(f, "%s|%d|%d\n", g_profiles[i].name, g_profiles[i].kills, g_profiles[i].tokens);
+    fclose(f);
+}
+static int Profile_GetOrCreate(const char *name) {
+    Profile_LoadAll();
+    int idx = Profile_Find(name);
+    if (idx >= 0) return idx;
+    if (g_profileCount >= PROFILE_MAX_STORE) return -1;
+    idx = g_profileCount++;
+    memset(&g_profiles[idx], 0, sizeof(g_profiles[idx]));
+    strncpy(g_profiles[idx].name, name, PROFILE_NAME_MAX - 1);
+    g_profiles[idx].name[PROFILE_NAME_MAX - 1] = '\0';
+    Profile_SaveAll();
+    return idx;
+}
+static int Profile_RankOf(int idx) {
+    if (idx < 0 || idx >= g_profileCount) return 0;
+    int rank = 1;
+    int k = g_profiles[idx].kills;
+    for (int i = 0; i < g_profileCount; i++)
+        if (g_profiles[i].kills > k) rank++;
+    return rank;
+}
+static void Profile_BuildLeaderboard(LeaderboardMsg *lb) {
+    Profile_LoadAll();
+    memset(lb, 0, sizeof(*lb));
+    /* простой selection: топ по kills */
+    int used[PROFILE_MAX_STORE];
+    memset(used, 0, sizeof(used));
+    int n = g_profileCount < LEADERBOARD_TOP ? g_profileCount : LEADERBOARD_TOP;
+    for (int place = 0; place < n; place++) {
+        int best = -1;
+        for (int i = 0; i < g_profileCount; i++) {
+            if (used[i]) continue;
+            if (best < 0 || g_profiles[i].kills > g_profiles[best].kills ||
+                (g_profiles[i].kills == g_profiles[best].kills &&
+                 g_profiles[i].tokens > g_profiles[best].tokens))
+                best = i;
+        }
+        if (best < 0) break;
+        used[best] = 1;
+        strncpy(lb->entries[place].name, g_profiles[best].name, PROFILE_NAME_MAX - 1);
+        lb->entries[place].kills = g_profiles[best].kills;
+        lb->entries[place].tokens = g_profiles[best].tokens;
+        lb->count++;
+    }
+}
+static void Profile_AddKill(int clientSlot) {
+    if (clientSlot < 0 || clientSlot >= MAX_PLAYERS) return;
+    int pidx = clientProfileIdx[clientSlot];
+    if (pidx < 0 || pidx >= g_profileCount) return;
+    g_profiles[pidx].kills++;
+    /* жетон за килл */
+    g_profiles[pidx].tokens += 2;
+    Profile_SaveAll();
+}
+static void Profile_AddTokens(int clientSlot, int amount) {
+    if (clientSlot < 0 || clientSlot >= MAX_PLAYERS || amount == 0) return;
+    int pidx = clientProfileIdx[clientSlot];
+    if (pidx < 0 || pidx >= g_profileCount) return;
+    g_profiles[pidx].tokens += amount;
+    if (g_profiles[pidx].tokens < 0) g_profiles[pidx].tokens = 0;
+    Profile_SaveAll();
+}
 float Network_GetMatchTimeLeft(void) { return isServer ? matchTimeLeft : clientTimeLeft; }
 
 // ---- карта для раздачи ----
@@ -871,6 +1004,168 @@ bool Network_ProbeServer(const char *addr, int timeoutMs, float *outPingMs) {
     return online;
 }
 
+bool Network_ProbeServerEx(const char *addr, int timeoutMs, float *outPingMs,
+                           int *outPlayerCount, int *outMaxPlayers) {
+    if (outPingMs) *outPingMs = 0.0f;
+    if (outPlayerCount) *outPlayerCount = -1;
+    if (outMaxPlayers) *outMaxPlayers = MAX_PLAYERS;
+    if (!InitSockets()) return false;
+
+    char host[128];
+    int port = SERVER_PORT;
+    const char *colon = strrchr(addr, ':');
+    if (colon) {
+        size_t hostLen = (size_t)(colon - addr);
+        if (hostLen >= sizeof(host)) hostLen = sizeof(host) - 1;
+        memcpy(host, addr, hostLen);
+        host[hostLen] = '\0';
+        int parsedPort = atoi(colon + 1);
+        if (parsedPort > 0) port = parsedPort;
+    } else {
+        snprintf(host, sizeof(host), "%s", addr);
+    }
+
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    char portStr[16];
+    snprintf(portStr, sizeof(portStr), "%d", port);
+    if (getaddrinfo(host, portStr, &hints, &res) != 0 || !res) return false;
+
+    SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s == INVALID_SOCKET) { freeaddrinfo(res); return false; }
+
+    double t0 = Net_Now();
+    bool online = ConnectWithTimeout(s, res, timeoutMs);
+    double t1 = Net_Now();
+    freeaddrinfo(res);
+    if (!online) { closesocket(s); return false; }
+    if (outPingMs) *outPingMs = (float)((t1 - t0) * 1000.0);
+
+    SetNonBlocking(s);
+    SetTcpNoDelay(s);
+    /* Короткий STATUS_REQ — сервер ответит playerCount */
+    SendFramed(s, MSG_STATUS_REQ, NULL, 0);
+    char rbuf[512];
+    int rlen = 0;
+    double deadline = Net_Now() + (timeoutMs > 0 ? timeoutMs / 1000.0 : 0.7);
+    while (Net_Now() < deadline) {
+        if (!PumpRecv(s, rbuf, &rlen)) break;
+        uint32_t type, len;
+        char payload[BUFFER_SIZE];
+        if (TryParseFrame(rbuf, &rlen, &type, payload, sizeof(payload), &len)) {
+            if (type == MSG_STATUS && len == sizeof(ServerStatusMsg)) {
+                ServerStatusMsg st;
+                memcpy(&st, payload, sizeof(st));
+                if (outPlayerCount) *outPlayerCount = st.playerCount;
+                if (outMaxPlayers) *outMaxPlayers = st.maxPlayers > 0 ? st.maxPlayers : MAX_PLAYERS;
+                break;
+            }
+            /* WELCOME/MAP_INFO от полноценного accept — игнор, продолжаем ждать STATUS */
+        }
+    }
+    closesocket(s);
+    return true;
+}
+
+void Network_SendProfileLogin(const char *name) {
+    if (isServer || sock == INVALID_SOCKET) return;
+    ProfileLoginMsg pl = {0};
+    if (name && name[0]) {
+        strncpy(pl.name, name, PROFILE_NAME_MAX - 1);
+        pl.name[PROFILE_NAME_MAX - 1] = '\0';
+    } else {
+        strncpy(pl.name, "Player", PROFILE_NAME_MAX - 1);
+    }
+    SendFramed(sock, MSG_PROFILE_LOGIN, &pl, sizeof(pl));
+}
+
+bool Network_ReceiveProfileInfo(ProfileInfoMsg *out) {
+    if (!hasPendingProfileInfo || !out) return false;
+    *out = pendingProfileInfo;
+    hasPendingProfileInfo = false;
+    return true;
+}
+
+void Network_RequestLeaderboard(void) {
+    if (isServer) {
+        Profile_BuildLeaderboard(&cachedLeaderboard);
+        hasCachedLeaderboard = true;
+        return;
+    }
+    if (sock == INVALID_SOCKET) return;
+    SendFramed(sock, MSG_LB_REQ, NULL, 0);
+}
+
+bool Network_ReceiveLeaderboard(LeaderboardMsg *out) {
+    if (!hasCachedLeaderboard || !out) return false;
+    *out = cachedLeaderboard;
+    return true;
+}
+
+const LeaderboardMsg *Network_GetCachedLeaderboard(void) {
+    return hasCachedLeaderboard ? &cachedLeaderboard : NULL;
+}
+
+bool Network_FetchLeaderboard(const char *addr, int timeoutMs, LeaderboardMsg *out) {
+    if (!out || !addr) return false;
+    memset(out, 0, sizeof(*out));
+    if (!InitSockets()) return false;
+
+    char host[128];
+    int port = SERVER_PORT;
+    const char *colon = strrchr(addr, ':');
+    if (colon) {
+        size_t hostLen = (size_t)(colon - addr);
+        if (hostLen >= sizeof(host)) hostLen = sizeof(host) - 1;
+        memcpy(host, addr, hostLen);
+        host[hostLen] = '\0';
+        int parsedPort = atoi(colon + 1);
+        if (parsedPort > 0) port = parsedPort;
+    } else {
+        snprintf(host, sizeof(host), "%s", addr);
+    }
+
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    char portStr[16];
+    snprintf(portStr, sizeof(portStr), "%d", port);
+    if (getaddrinfo(host, portStr, &hints, &res) != 0 || !res) return false;
+
+    SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s == INVALID_SOCKET) { freeaddrinfo(res); return false; }
+    bool online = ConnectWithTimeout(s, res, timeoutMs);
+    freeaddrinfo(res);
+    if (!online) { closesocket(s); return false; }
+
+    SetNonBlocking(s);
+    SetTcpNoDelay(s);
+    SendFramed(s, MSG_LB_REQ, NULL, 0);
+
+    char rbuf[8192];
+    int rlen = 0;
+    double deadline = Net_Now() + (timeoutMs > 0 ? timeoutMs / 1000.0 : 1.5);
+    bool got = false;
+    while (Net_Now() < deadline) {
+        if (!PumpRecv(s, rbuf, &rlen)) break;
+        uint32_t type, len;
+        char payload[BUFFER_SIZE];
+        if (!TryParseFrame(rbuf, &rlen, &type, payload, sizeof(payload), &len)) continue;
+        if (type == MSG_LB_DATA && len == sizeof(LeaderboardMsg)) {
+            memcpy(out, payload, sizeof(LeaderboardMsg));
+            cachedLeaderboard = *out;
+            hasCachedLeaderboard = true;
+            got = true;
+            break;
+        }
+    }
+    closesocket(s);
+    return got;
+}
+
 void Network_SendState(PlayerState state) {
     if (isServer) {
         if (!hostPlaysToo) return; // dedicated-сервер сам не играет
@@ -912,6 +1207,8 @@ static void ClearClientSlot(int i) {
     clientMapTransferring[i] = false;
     clientStates[i] = (PlayerState){0};
     clientRecvLen[i] = 0;
+    clientNames[i][0] = '\0';
+    clientProfileIdx[i] = -1;
     rosterDirty = true;
 }
 
@@ -1032,6 +1329,8 @@ static void ResolveHitEvent(HitEvent event) {
             if (matchPhase == MATCH_PLAYING) {
                 int sf = clientStates[event.shooterId].faction;
                 if (sf == 0) scoreShield += MATCH_PTS_KILL; else scoreVolya += MATCH_PTS_KILL;
+                /* Килл + жетоны на серверном профиле стрелка */
+                Profile_AddKill(event.shooterId);
             }
             // В WAITING/COUNTDOWN — мгновенный респаун на сервере
             if (matchPhase == MATCH_WAITING || matchPhase == MATCH_COUNTDOWN) {
@@ -1085,6 +1384,8 @@ static void AcceptNewConnections(void) {
         clientStates[idx] = (PlayerState){0};
         clientRecvLen[idx] = 0;
         clientLastSeen[idx] = Net_Now();
+        clientNames[idx][0] = '\0';
+        clientProfileIdx[idx] = -1;
         rosterDirty = true; // новый игрок — сразу рассылаем snapshot
 
         WelcomeMsg w = { .assignedId = idx };
@@ -1164,6 +1465,46 @@ bool Network_ReceiveSnapshot(GameSnapshot *snap) {
                     memcpy(&bse, payload, sizeof(bse));
                     ApplyBotScore(bse.faction, bse.points);
                     gotAny = true;
+                } else if (type == MSG_STATUS_REQ) {
+                    ServerStatusMsg st;
+                    /* Не считаем сам probe-сокет в playerCount */
+                    st.playerCount = CountConnectedPlayers();
+                    if (st.playerCount > 0) st.playerCount -= 1; /* текущий слот — probe */
+                    if (st.playerCount < 0) st.playerCount = 0;
+                    st.maxPlayers = MAX_PLAYERS;
+                    st.matchPhase = matchPhase;
+                    SendFramed(cs, MSG_STATUS, &st, sizeof(st));
+                    /* Probe: сразу освобождаем слот, чтобы не занимать место игрока */
+                    if (!clientNames[i][0]) {
+                        ClearClientSlot(i);
+                        break;
+                    }
+                } else if (type == MSG_PROFILE_LOGIN && len == sizeof(ProfileLoginMsg)) {
+                    ProfileLoginMsg pl;
+                    memcpy(&pl, payload, sizeof(pl));
+                    pl.name[PROFILE_NAME_MAX - 1] = '\0';
+                    strncpy(clientNames[i], pl.name, PROFILE_NAME_MAX - 1);
+                    clientNames[i][PROFILE_NAME_MAX - 1] = '\0';
+                    int pidx = Profile_GetOrCreate(pl.name[0] ? pl.name : "Player");
+                    clientProfileIdx[i] = pidx;
+                    ProfileInfoMsg info = {0};
+                    if (pidx >= 0) {
+                        info.tokens = g_profiles[pidx].tokens;
+                        info.kills = g_profiles[pidx].kills;
+                        info.rank = Profile_RankOf(pidx);
+                    }
+                    SendFramed(cs, MSG_PROFILE_INFO, &info, sizeof(info));
+                    printf("Profile login slot %d: %s (kills=%d tokens=%d rank=%d)\n",
+                           i, clientNames[i], info.kills, info.tokens, info.rank);
+                } else if (type == MSG_LB_REQ) {
+                    LeaderboardMsg lb;
+                    Profile_BuildLeaderboard(&lb);
+                    SendFramed(cs, MSG_LB_DATA, &lb, sizeof(lb));
+                    /* Короткий fetch без профиля — не держим слот */
+                    if (!clientNames[i][0]) {
+                        ClearClientSlot(i);
+                        break;
+                    }
                 }
             }
         }
@@ -1209,6 +1550,12 @@ bool Network_ReceiveSnapshot(GameSnapshot *snap) {
                 if (pendingConfirmCount < MAX_PACKETS_PER_TICK) {
                     memcpy(&pendingConfirms[pendingConfirmCount++], payload, sizeof(HitConfirm));
                 }
+            } else if (type == MSG_PROFILE_INFO && len == sizeof(ProfileInfoMsg)) {
+                memcpy(&pendingProfileInfo, payload, sizeof(ProfileInfoMsg));
+                hasPendingProfileInfo = true;
+            } else if (type == MSG_LB_DATA && len == sizeof(LeaderboardMsg)) {
+                memcpy(&cachedLeaderboard, payload, sizeof(LeaderboardMsg));
+                hasCachedLeaderboard = true;
             } else if (type == MSG_PONG && len >= 8) {
                 // payload = uint64_t миллисекунды (монотонные)
                 uint64_t sentMs = 0;
