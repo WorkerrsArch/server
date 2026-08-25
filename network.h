@@ -17,7 +17,7 @@
 #define MAX_ROOMS 3                // скрытые параллельные матчи на dedicated
 #define MAX_SERVER_SLOTS (MAX_PLAYERS * MAX_ROOMS) /* 24 слота на сервере */
 #define SERVER_PORT 50000          // порт по умолчанию (он же "Internal Port" в Railway TCP Proxy)
-#define BUFFER_SIZE 4096
+#define BUFFER_SIZE 8192
 #define CLIENT_TIMEOUT 5.0f
 #define MAX_PACKETS_PER_TICK 64
 #define HITSCAN_RANGE 100.0f       // единая дальность хитскана для клиента и сервера
