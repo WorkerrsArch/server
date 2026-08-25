@@ -85,8 +85,28 @@ int Network_GetScoreShield(void) { return isServer ? scoreShield : clientScoreSh
 int Network_GetScoreVolya(void) { return isServer ? scoreVolya : clientScoreVolya; }
 
 /* ---- Серверные профили (жетоны + киллы) ---- */
-#define PROFILES_PATH "profiles.dat"
+/* Railway Volume: mount /data. RAILWAY_VOLUME_MOUNT_PATH или /data, иначе cwd. */
 #define PROFILE_MAX_STORE 512
+static const char *Profiles_Path(void) {
+    static char path[256];
+    static int inited = 0;
+    if (!inited) {
+        const char *vol = getenv("RAILWAY_VOLUME_MOUNT_PATH");
+        if (vol && vol[0]) {
+            snprintf(path, sizeof(path), "%s/profiles.dat", vol);
+        } else {
+#ifndef _WIN32
+            if (access("/data", W_OK) == 0)
+                snprintf(path, sizeof(path), "/data/profiles.dat");
+            else
+#endif
+                snprintf(path, sizeof(path), "profiles.dat");
+        }
+        inited = 1;
+        printf("Profiles path: %s\n", path);
+    }
+    return path;
+}
 typedef struct {
     char name[PROFILE_NAME_MAX];
     int kills;
@@ -114,7 +134,7 @@ static void Profile_LoadAll(void) {
     if (g_profilesLoaded) return;
     g_profilesLoaded = true;
     g_profileCount = 0;
-    FILE *f = fopen(PROFILES_PATH, "r");
+    FILE *f = fopen(Profiles_Path(), "r");
     if (!f) return;
     char line[160];
     while (fgets(line, sizeof(line), f) && g_profileCount < PROFILE_MAX_STORE) {
@@ -143,7 +163,7 @@ static void Profile_LoadAll(void) {
     fclose(f);
 }
 static void Profile_SaveAll(void) {
-    FILE *f = fopen(PROFILES_PATH, "w");
+    FILE *f = fopen(Profiles_Path(), "w");
     if (!f) return;
     for (int i = 0; i < g_profileCount; i++)
         fprintf(f, "%s|%d|%d\n", g_profiles[i].name, g_profiles[i].kills, g_profiles[i].tokens);
