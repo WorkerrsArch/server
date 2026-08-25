@@ -421,22 +421,6 @@ static int clientRecvLen[MAX_SERVER_SLOTS];
 static int clientCount = 0; /* верхняя граница занятых global-слотов (не «число игроков») */
 static float clientSpawnProtect[MAX_SERVER_SLOTS];
 
-// ---- probe-пул: временная передержка новых соединений ДО решения join/probe ----
-// Раньше accept() сразу пытался посадить новое соединение в игровой слот
-// (PickRoomForJoin/AllocSlotInRoom), и лидерборд/статус-probe конкурировали
-// за место с реальными игроками - при забитых румах probe молча резался
-// сервером ещё до чтения MSG_LB_REQ/MSG_STATUS_REQ ("Нет связи с сервером").
-// Теперь новый коннект сперва живёт здесь: если за PROBE_WAIT_SEC придёт
-// MSG_LB_REQ/MSG_STATUS_REQ - обслуживаем сразу, БЕЗ игрового слота.
-// Если за это время ничего не пришло (реальный клиент молча ждёт WELCOME) -
-// отдаём соединение в обычный join-путь.
-#define MAX_PROBE_SLOTS 8
-#define PROBE_WAIT_SEC 0.25
-static SOCKET probeSockets[MAX_PROBE_SLOTS];
-static char probeRecvBuf[MAX_PROBE_SLOTS][RECV_STREAM_BUF];
-static int probeRecvLen[MAX_PROBE_SLOTS];
-static double probeAcceptedAt[MAX_PROBE_SLOTS];
-
 // ---- клиентское состояние (соединение с сервером) ----
 static SOCKET sock = INVALID_SOCKET;
 static char recvStreamBuf[RECV_STREAM_BUF];
@@ -721,7 +705,6 @@ static bool StartListenSocket(int port) {
     SetNonBlocking(listenSock);
 
     for (int i = 0; i < MAX_SERVER_SLOTS; i++) { clientSockets[i] = INVALID_SOCKET; clientConnected[i] = false; clientRoom[i] = -1; clientLocalId[i] = -1; }
-    for (int j = 0; j < MAX_PROBE_SLOTS; j++) { probeSockets[j] = INVALID_SOCKET; probeRecvLen[j] = 0; }
     isServer = true;
     return true;
 }
@@ -1499,55 +1482,6 @@ PlayerState Network_GetSelfAuthoritativeState(void) {
     return clientStates[0];
 }
 
-// Настоящий join игрока: выделяет игровой слот и шлёт WELCOME+MAP_INFO.
-// pending/pendingLen - байты, которые уже успели прийти от клиента и были
-// прочитаны, пока соединение сидело в probe-пуле (обычно 0, но если это
-// оказался не probe-тип фрейма, а что-то другое - не теряем его).
-static void AcceptAsGameJoin(SOCKET c, const char *pending, int pendingLen) {
-    int room = PickRoomForJoin();
-    if (room < 0) {
-        printf("Server full (all rooms)\n");
-        closesocket(c);
-        return;
-    }
-    int idx = AllocSlotInRoom(room);
-    if (idx < 0) {
-        closesocket(c);
-        return;
-    }
-
-    clientSockets[idx] = c;
-    clientConnected[idx] = true;
-    clientStates[idx] = (PlayerState){0};
-    clientRecvLen[idx] = 0;
-    if (pending && pendingLen > 0 && pendingLen <= RECV_STREAM_BUF) {
-        memcpy(clientRecvBuf[idx], pending, (size_t)pendingLen);
-        clientRecvLen[idx] = pendingLen;
-    }
-    clientLastSeen[idx] = Net_Now();
-    clientNames[idx][0] = '\0';
-    clientProfileIdx[idx] = -1;
-    clientRoom[idx] = room;
-    clientLocalId[idx] = idx % MAX_PLAYERS;
-    if (idx + 1 > clientCount) clientCount = idx + 1;
-    rosterDirty = true;
-
-    WelcomeMsg w = { .assignedId = clientLocalId[idx] };
-    SendFramed(c, MSG_WELCOME, &w, sizeof(w));
-    SendMapInfo(c);
-    printf("Client id=%d room=%d local=%d (room players %d)\n",
-           idx, room, clientLocalId[idx], CountRoomPlayers(room));
-}
-
-static void ClearProbeSlot(int j) {
-    if (j < 0 || j >= MAX_PROBE_SLOTS) return;
-    if (probeSockets[j] != INVALID_SOCKET) {
-        closesocket(probeSockets[j]);
-        probeSockets[j] = INVALID_SOCKET;
-    }
-    probeRecvLen[j] = 0;
-}
-
 static void AcceptNewConnections(void) {
     for (int iter = 0; iter < 8; iter++) {
         struct sockaddr_in from;
@@ -1557,83 +1491,35 @@ static void AcceptNewConnections(void) {
         SetNonBlocking(c);
         SetTcpNoDelay(c);
 
-        int pj = -1;
-        for (int j = 0; j < MAX_PROBE_SLOTS; j++) {
-            if (probeSockets[j] == INVALID_SOCKET) { pj = j; break; }
-        }
-        if (pj < 0) {
-            // Все probe-слоты заняты одновременно (маловероятный всплеск) -
-            // не копим очередь, обслуживаем как обычный join сразу же.
-            AcceptAsGameJoin(c, NULL, 0);
+        int room = PickRoomForJoin();
+        if (room < 0) {
+            printf("Server full (all rooms)\n");
+            closesocket(c);
             continue;
         }
-        probeSockets[pj] = c;
-        probeRecvLen[pj] = 0;
-        probeAcceptedAt[pj] = Net_Now();
-    }
-}
-
-// Обслуживает соединения, которые сидят в probe-пуле. Вызывается каждый
-// тик наряду с AcceptNewConnections. Ничего не блокирует: PumpRecv и
-// проверка накопленного буфера неблокирующие, ожидание PROBE_WAIT_SEC
-// растянуто по тикам, а не в одном вызове.
-static void ProcessProbeConnections(void) {
-    for (int j = 0; j < MAX_PROBE_SLOTS; j++) {
-        if (probeSockets[j] == INVALID_SOCKET) continue;
-        SOCKET ps = probeSockets[j];
-
-        if (!PumpRecv(ps, probeRecvBuf[j], &probeRecvLen[j])) {
-            ClearProbeSlot(j);
+        int idx = AllocSlotInRoom(room);
+        if (idx < 0) {
+            closesocket(c);
             continue;
         }
 
-        uint32_t type, len;
-        char payload[BUFFER_SIZE];
-        if (TryParseFrame(probeRecvBuf[j], &probeRecvLen[j], &type, payload, sizeof(payload), &len)) {
-            if (type == MSG_STATUS_REQ) {
-                ServerStatusMsg st;
-                st.playerCount = CountConnectedPlayers();
-                st.maxPlayers = MAX_SERVER_SLOTS;
-                st.matchPhase = rooms[0].phase;
-                SendFramed(ps, MSG_STATUS, &st, sizeof(st));
-                ClearProbeSlot(j);
-            } else if (type == MSG_LB_REQ) {
-                LeaderboardMsg lb;
-                Profile_BuildLeaderboard(&lb);
-                SendFramed(ps, MSG_LB_DATA, &lb, sizeof(lb));
-                ClearProbeSlot(j);
-            } else {
-                // Не probe-тип - похоже на попытку join'а необычным клиентом.
-                // Передаём соединение в обычный путь вместе с уже прочитанным
-                // куском потока (разобранный кадр + необработанный хвост),
-                // чтобы ничего не потерять.
-                probeSockets[j] = INVALID_SOCKET; // владение сокетом передаётся дальше
-                char merged[RECV_STREAM_BUF];
-                int mergedLen = 0;
-                uint32_t hdr[2] = { type, len };
-                memcpy(merged, hdr, sizeof(hdr));
-                mergedLen = sizeof(hdr);
-                if (len > 0) { memcpy(merged + mergedLen, payload, len); mergedLen += (int)len; }
-                if (probeRecvLen[j] > 0 && mergedLen + probeRecvLen[j] <= (int)sizeof(merged)) {
-                    memcpy(merged + mergedLen, probeRecvBuf[j], probeRecvLen[j]);
-                    mergedLen += probeRecvLen[j];
-                }
-                probeRecvLen[j] = 0;
-                AcceptAsGameJoin(ps, merged, mergedLen);
-            }
-            continue;
-        }
+        clientSockets[idx] = c;
+        clientConnected[idx] = true;
+        clientStates[idx] = (PlayerState){0};
+        clientRecvLen[idx] = 0;
+        clientLastSeen[idx] = Net_Now();
+        clientNames[idx][0] = '\0';
+        clientProfileIdx[idx] = -1;
+        clientRoom[idx] = room;
+        clientLocalId[idx] = idx % MAX_PLAYERS;
+        if (idx + 1 > clientCount) clientCount = idx + 1;
+        rosterDirty = true;
 
-        // Ничего не пришло за PROBE_WAIT_SEC - трактуем как реальный join
-        // (клиент молча ждёт WELCOME, как и раньше).
-        if (Net_Now() - probeAcceptedAt[j] > PROBE_WAIT_SEC) {
-            probeSockets[j] = INVALID_SOCKET; // владение сокетом передаётся дальше
-            char pending[RECV_STREAM_BUF];
-            int pendingLen = probeRecvLen[j];
-            if (pendingLen > 0) memcpy(pending, probeRecvBuf[j], pendingLen);
-            probeRecvLen[j] = 0;
-            AcceptAsGameJoin(ps, pendingLen > 0 ? pending : NULL, pendingLen);
-        }
+        WelcomeMsg w = { .assignedId = clientLocalId[idx] };
+        SendFramed(c, MSG_WELCOME, &w, sizeof(w));
+        SendMapInfo(c);
+        printf("Client id=%d room=%d local=%d (room players %d)\n",
+               idx, room, clientLocalId[idx], CountRoomPlayers(room));
     }
 }
 
