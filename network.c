@@ -70,19 +70,89 @@ bool isServer = false;
 static int myId = -1;
 static bool hostPlaysToo = true; // false для настоящего dedicated-сервера (server_main.c)
 
-// ---- матч ----
-static int   matchPhase = MATCH_WAITING;
-static int   scoreShield = 0, scoreVolya = 0;
-static float matchTimeLeft = 0.0f;
-static double matchLastTick = 0.0;
+// ---- матч (скрытые румы на dedicated: до MAX_ROOMS параллельно) ----
+typedef struct {
+    int phase;
+    int scoreShield, scoreVolya;
+    float timeLeft;
+    double lastTick;
+} RoomMatch;
+static RoomMatch rooms[MAX_ROOMS];
+static int clientRoom[MAX_SERVER_SLOTS];       /* -1 = пусто */
+static int clientLocalId[MAX_SERVER_SLOTS];    /* 0..MAX_PLAYERS-1 в руме */
+static int myRoomId = 0;                      /* клиент: свой рум (скрыт от UI) */
+/* объявлены ниже полностью; здесь — чтобы CountRoomPlayers/Alloc видели */
+static bool clientConnected[MAX_SERVER_SLOTS];
+static int lastHitRoom = 0;
+
 static int   clientMatchPhase = MATCH_WAITING;
 static int   clientScoreShield = 0, clientScoreVolya = 0;
 static float clientTimeLeft = 0.0f;
 
-static void MatchTick(void); // body after Net_Now / clientCount
-int Network_GetMatchPhase(void) { return isServer ? matchPhase : clientMatchPhase; }
-int Network_GetScoreShield(void) { return isServer ? scoreShield : clientScoreShield; }
-int Network_GetScoreVolya(void) { return isServer ? scoreVolya : clientScoreVolya; }
+static void MatchTick(void);
+static void Rooms_Init(void) {
+    for (int r = 0; r < MAX_ROOMS; r++) {
+        rooms[r].phase = MATCH_WAITING;
+        rooms[r].scoreShield = rooms[r].scoreVolya = 0;
+        rooms[r].timeLeft = 0.f;
+        rooms[r].lastTick = 0.0;
+    }
+    for (int i = 0; i < MAX_SERVER_SLOTS; i++) {
+        clientRoom[i] = -1;
+        clientLocalId[i] = -1;
+    }
+}
+static int CountRoomPlayers(int r) {
+    int n = 0;
+    for (int i = 0; i < MAX_SERVER_SLOTS; i++)
+        if (clientConnected[i] && clientRoom[i] == r) n++;
+    return n;
+}
+/* Выбрать рум для новичка: WAITING/COUNTDOWN с местом → новый пустой → PLAYING с местом */
+static int PickRoomForJoin(void) {
+    int bestWait = -1, bestWaitN = 999;
+    for (int r = 0; r < MAX_ROOMS; r++) {
+        int n = CountRoomPlayers(r);
+        if (n >= MAX_PLAYERS) continue;
+        if (rooms[r].phase == MATCH_WAITING || rooms[r].phase == MATCH_COUNTDOWN) {
+            if (n < bestWaitN) { bestWaitN = n; bestWait = r; }
+        }
+    }
+    if (bestWait >= 0) return bestWait;
+    for (int r = 0; r < MAX_ROOMS; r++) {
+        if (CountRoomPlayers(r) == 0) {
+            rooms[r].phase = MATCH_WAITING;
+            rooms[r].scoreShield = rooms[r].scoreVolya = 0;
+            rooms[r].timeLeft = 0.f;
+            return r;
+        }
+    }
+    for (int r = 0; r < MAX_ROOMS; r++) {
+        if (CountRoomPlayers(r) < MAX_PLAYERS)
+            return r;
+    }
+    return -1;
+}
+static int AllocSlotInRoom(int room) {
+    int base = room * MAX_PLAYERS;
+    for (int local = 0; local < MAX_PLAYERS; local++) {
+        int g = base + local;
+        if (!clientConnected[g]) return g;
+    }
+    return -1;
+}
+int Network_GetMatchPhase(void) {
+    if (!isServer) return clientMatchPhase;
+    return rooms[myRoomId >= 0 && myRoomId < MAX_ROOMS ? myRoomId : 0].phase;
+}
+int Network_GetScoreShield(void) {
+    if (!isServer) return clientScoreShield;
+    return rooms[myRoomId >= 0 && myRoomId < MAX_ROOMS ? myRoomId : 0].scoreShield;
+}
+int Network_GetScoreVolya(void) {
+    if (!isServer) return clientScoreVolya;
+    return rooms[myRoomId >= 0 && myRoomId < MAX_ROOMS ? myRoomId : 0].scoreVolya;
+}
 
 /* ---- Серверные профили (жетоны + киллы) ---- */
 /* Railway Volume: mount /data. RAILWAY_VOLUME_MOUNT_PATH или /data, иначе cwd. */
@@ -115,8 +185,8 @@ typedef struct {
 static StoredProfile g_profiles[PROFILE_MAX_STORE];
 static int g_profileCount = 0;
 static bool g_profilesLoaded = false;
-static char clientNames[MAX_PLAYERS][PROFILE_NAME_MAX];
-static int  clientProfileIdx[MAX_PLAYERS]; /* индекс в g_profiles, -1 = нет */
+static char clientNames[MAX_SERVER_SLOTS][PROFILE_NAME_MAX];
+static int  clientProfileIdx[MAX_SERVER_SLOTS]; /* индекс в g_profiles, -1 = нет */
 
 static ProfileInfoMsg pendingProfileInfo;
 static bool hasPendingProfileInfo = false;
@@ -230,7 +300,11 @@ static void Profile_AddTokens(int clientSlot, int amount) {
     if (g_profiles[pidx].tokens < 0) g_profiles[pidx].tokens = 0;
     Profile_SaveAll();
 }
-float Network_GetMatchTimeLeft(void) { return isServer ? matchTimeLeft : clientTimeLeft; }
+float Network_GetMatchTimeLeft(void) {
+    if (!isServer) return clientTimeLeft;
+    int r = (myRoomId >= 0 && myRoomId < MAX_ROOMS) ? myRoomId : 0;
+    return rooms[r].timeLeft;
+}
 
 // ---- карта для раздачи ----
 static unsigned char *mapFileData = NULL;
@@ -337,16 +411,15 @@ static float ServerBlockRaycast(Vector3 o, Vector3 d, float maxDist) {
 
 // ---- серверное состояние ----
 static SOCKET listenSock = INVALID_SOCKET;
-static SOCKET clientSockets[MAX_PLAYERS];
-static PlayerState clientStates[MAX_PLAYERS];
-static bool clientConnected[MAX_PLAYERS];
-static double clientLastSeen[MAX_PLAYERS];
-static bool clientMapTransferring[MAX_PLAYERS]; // true пока шлём/ждём карту — не кикать по таймауту
-static char clientRecvBuf[MAX_PLAYERS][RECV_STREAM_BUF];
-static int clientRecvLen[MAX_PLAYERS];
-static int clientCount = 0;
-/* Защита после респавна на сервере (сек) */
-static float clientSpawnProtect[MAX_PLAYERS];
+static SOCKET clientSockets[MAX_SERVER_SLOTS];
+static PlayerState clientStates[MAX_SERVER_SLOTS];
+/* clientConnected объявлен выше (рядом с clientRoom) */
+static double clientLastSeen[MAX_SERVER_SLOTS];
+static bool clientMapTransferring[MAX_SERVER_SLOTS];
+static char clientRecvBuf[MAX_SERVER_SLOTS][RECV_STREAM_BUF];
+static int clientRecvLen[MAX_SERVER_SLOTS];
+static int clientCount = 0; /* верхняя граница занятых global-слотов (не «число игроков») */
+static float clientSpawnProtect[MAX_SERVER_SLOTS];
 
 // ---- клиентское состояние (соединение с сервером) ----
 static SOCKET sock = INVALID_SOCKET;
@@ -389,7 +462,7 @@ static double Net_Now(void) {
 
 static int CountConnectedPlayers(void) {
     int n = 0;
-    for (int i = 0; i < clientCount; i++)
+    for (int i = 0; i < MAX_SERVER_SLOTS; i++)
         if (clientConnected[i]) n++;
     return n;
 }
@@ -398,74 +471,88 @@ static int CountConnectedPlayers(void) {
 // по игроку) — доверяем присланному значению points (клиент уже посчитал
 // его по MATCH_PTS_BOT_KILL/MATCH_PTS_BOT_DAMAGE_DIV), но клэмпим сверху
 // на случай мусора/читов в одном сообщении и не считаем очки вне PLAYING.
-static void ApplyBotScore(int faction, int points) {
-    if (matchPhase != MATCH_PLAYING) return;
+static void ApplyBotScoreForRoom(int room, int faction, int points) {
+    if (room < 0 || room >= MAX_ROOMS) return;
+    if (rooms[room].phase != MATCH_PLAYING) return;
     if (points <= 0) return;
-    if (points > MATCH_PTS_KILL) points = MATCH_PTS_KILL; // не больше обычного килла за одно сообщение
-    if (faction == 0) scoreShield += points; else scoreVolya += points;
+    if (points > MATCH_PTS_KILL) points = MATCH_PTS_KILL;
+    if (faction == 0) rooms[room].scoreShield += points; else rooms[room].scoreVolya += points;
 }
-
-static void MatchResetScores(void) { scoreShield = 0; scoreVolya = 0; }
-static void MatchStartPlaying(void) {
-    matchPhase = MATCH_PLAYING;
-    matchTimeLeft = MATCH_ROUND_SEC;
-    MatchResetScores();
-    for (int i = 0; i < clientCount; i++) {
-        if (!clientConnected[i]) continue;
+static void ApplyBotScore(int faction, int points) {
+    ApplyBotScoreForRoom(0, faction, points);
+}
+static void MatchStartPlayingRoom(int r) {
+    if (r < 0 || r >= MAX_ROOMS) return;
+    rooms[r].phase = MATCH_PLAYING;
+    rooms[r].timeLeft = MATCH_ROUND_SEC;
+    rooms[r].scoreShield = rooms[r].scoreVolya = 0;
+    for (int i = 0; i < MAX_SERVER_SLOTS; i++) {
+        if (!clientConnected[i] || clientRoom[i] != r) continue;
         clientStates[i].health = (clientStates[i].faction == 0) ? 110.0f : 100.0f;
         clientStates[i].alive = true;
         clientSpawnProtect[i] = 3.0f;
         clientStates[i].spawnProtected = 1;
     }
-    printf("Match: PLAYING\n");
+    printf("Room %d: PLAYING (%d players)\n", r, CountRoomPlayers(r));
 }
 static void MatchTick(void) {
     double now = Net_Now();
-    float dt = (matchLastTick > 0.0) ? (float)(now - matchLastTick) : 0.0f;
-    if (dt < 0.f) dt = 0.f;
-    if (dt > 0.25f) dt = 0.25f;
-    matchLastTick = now;
-    for (int i = 0; i < clientCount; i++) {
+    for (int i = 0; i < MAX_SERVER_SLOTS; i++) {
+        if (!clientConnected[i]) continue;
+        float dt_sp = 0.033f;
         if (clientSpawnProtect[i] > 0.0f) {
-            clientSpawnProtect[i] -= dt;
+            clientSpawnProtect[i] -= dt_sp;
             if (clientSpawnProtect[i] < 0.0f) clientSpawnProtect[i] = 0.0f;
         }
-        if (clientConnected[i])
-            clientStates[i].spawnProtected = (clientSpawnProtect[i] > 0.0f) ? 1 : 0;
+        clientStates[i].spawnProtected = (clientSpawnProtect[i] > 0.0f) ? 1 : 0;
     }
-    int n = CountConnectedPlayers();
-    if (matchPhase == MATCH_WAITING) {
-        matchTimeLeft = 0.f;
-        if (n >= 2) { matchPhase = MATCH_COUNTDOWN; matchTimeLeft = MATCH_WAIT_SEC; }
-    } else if (matchPhase == MATCH_COUNTDOWN) {
-        if (n < 2) { matchPhase = MATCH_WAITING; matchTimeLeft = 0.f; }
-        else {
-            matchTimeLeft -= dt;
-            if (matchTimeLeft <= 0.f) MatchStartPlaying();
+    for (int r = 0; r < MAX_ROOMS; r++) {
+        float dt = (rooms[r].lastTick > 0.0) ? (float)(now - rooms[r].lastTick) : 0.0f;
+        if (dt < 0.f) dt = 0.f;
+        if (dt > 0.25f) dt = 0.25f;
+        rooms[r].lastTick = now;
+        int n = CountRoomPlayers(r);
+        if (n == 0) {
+            rooms[r].phase = MATCH_WAITING;
+            rooms[r].timeLeft = 0.f;
+            rooms[r].scoreShield = rooms[r].scoreVolya = 0;
+            continue;
         }
-    } else if (matchPhase == MATCH_PLAYING) {
-        matchTimeLeft -= dt;
-        if (scoreShield >= MATCH_SCORE_WIN || scoreVolya >= MATCH_SCORE_WIN || matchTimeLeft <= 0.f) {
-            matchPhase = MATCH_ENDED;
-            matchTimeLeft = 0.f;
-        }
-    } else if (matchPhase == MATCH_ENDED) {
-        static float endHold = 0.f;
-        endHold += dt;
-        if (endHold > MATCH_END_HOLD_SEC) {
-            endHold = 0.f;
-            matchPhase = MATCH_WAITING;
-            MatchResetScores();
-            /* Готовим игроков к следующему циклу */
-            for (int i = 0; i < clientCount; i++) {
-                if (!clientConnected[i]) continue;
-                clientStates[i].health = 100.0f;
-                clientStates[i].alive = true;
+        if (rooms[r].phase == MATCH_WAITING) {
+            rooms[r].timeLeft = 0.f;
+            if (n >= 2) {
+                rooms[r].phase = MATCH_COUNTDOWN;
+                rooms[r].timeLeft = MATCH_WAIT_SEC;
+                printf("Room %d: COUNTDOWN (%d players)\n", r, n);
             }
-            printf("Match: back to WAITING (next round)\n");
+        } else if (rooms[r].phase == MATCH_COUNTDOWN) {
+            if (n < 2) {
+                rooms[r].phase = MATCH_WAITING;
+                rooms[r].timeLeft = 0.f;
+            } else {
+                rooms[r].timeLeft -= dt;
+                if (rooms[r].timeLeft <= 0.f) MatchStartPlayingRoom(r);
+            }
+        } else if (rooms[r].phase == MATCH_PLAYING) {
+            rooms[r].timeLeft -= dt;
+            if (rooms[r].scoreShield >= MATCH_SCORE_WIN || rooms[r].scoreVolya >= MATCH_SCORE_WIN ||
+                rooms[r].timeLeft <= 0.f) {
+                rooms[r].phase = MATCH_ENDED;
+                rooms[r].timeLeft = MATCH_END_HOLD_SEC;
+                printf("Room %d: ENDED S=%d V=%d\n", r, rooms[r].scoreShield, rooms[r].scoreVolya);
+            }
+        } else if (rooms[r].phase == MATCH_ENDED) {
+            rooms[r].timeLeft -= dt;
+            if (rooms[r].timeLeft <= 0.f) {
+                rooms[r].phase = MATCH_WAITING;
+                rooms[r].timeLeft = 0.f;
+                rooms[r].scoreShield = rooms[r].scoreVolya = 0;
+            }
         }
     }
 }
+
+
 
 static void SetNonBlocking(SOCKET s) {
 #ifdef _WIN32
@@ -617,7 +704,7 @@ static bool StartListenSocket(int port) {
     }
     SetNonBlocking(listenSock);
 
-    for (int i = 0; i < MAX_PLAYERS; i++) { clientSockets[i] = INVALID_SOCKET; clientConnected[i] = false; }
+    for (int i = 0; i < MAX_SERVER_SLOTS; i++) { clientSockets[i] = INVALID_SOCKET; clientConnected[i] = false; clientRoom[i] = -1; clientLocalId[i] = -1; }
     isServer = true;
     return true;
 }
@@ -893,6 +980,8 @@ static bool ClientSyncMap(void) {
 }
 
 bool Network_InitServer(void) {
+    Rooms_Init();
+    myRoomId = 0;
     if (!StartListenSocket(SERVER_PORT)) return false;
     hostPlaysToo = true;
     myId = 0;
@@ -900,12 +989,15 @@ bool Network_InitServer(void) {
     clientStates[0] = (PlayerState){ .health = 100, .alive = true };
     clientConnected[0] = true;
     clientLastSeen[0] = Net_Now();
+    clientRoom[0] = 0;
+    clientLocalId[0] = 0;
     Network_LoadMapFile(NETWORK_MAP_HOST_PATH);
     printf("TCP listen-server started on port %d\n", SERVER_PORT);
     return true;
 }
 
 bool Network_InitDedicatedServer(int port) {
+    Rooms_Init();
     if (!StartListenSocket(port)) return false;
     hostPlaysToo = false;
     myId = -1;      // у dedicated-сервера нет своего игрока
@@ -1219,6 +1311,7 @@ static bool rosterDirty = false;
 // Полностью освободить слот: закрыть сокет, обнулить PlayerState
 // (alive=false, position={0}), чтобы в snapshot не уезжала старая поза.
 static void ClearClientSlot(int i) {
+    if (i < 0 || i >= MAX_SERVER_SLOTS) return;
     if (clientSockets[i] != INVALID_SOCKET) {
         closesocket(clientSockets[i]);
         clientSockets[i] = INVALID_SOCKET;
@@ -1229,13 +1322,15 @@ static void ClearClientSlot(int i) {
     clientRecvLen[i] = 0;
     clientNames[i][0] = '\0';
     clientProfileIdx[i] = -1;
+    clientRoom[i] = -1;
+    clientLocalId[i] = -1;
     rosterDirty = true;
 }
 
 static void ServerCheckTimeouts(void) {
     double now = Net_Now();
-    int base = hostPlaysToo ? 1 : 0;
-    for (int i = base; i < clientCount; i++) {
+    for (int i = 0; i < MAX_SERVER_SLOTS; i++) {
+        if (hostPlaysToo && i == 0) continue;
         // Пока клиент качает карту (~18 МБ), STATE не шлёт — таймаут 5с убивал
         // соединение на последних килобайтах (см. "connection lost at 18370560/...").
         if (!clientConnected[i] || clientMapTransferring[i]) continue;
@@ -1248,9 +1343,10 @@ static void ServerCheckTimeouts(void) {
 
 void Network_BroadcastHitConfirm(HitConfirm confirm) {
     if (!isServer) return;
-    int base = hostPlaysToo ? 1 : 0;
-    for (int i = base; i < clientCount; i++) {
-        if (!clientConnected[i]) continue;
+    int room = lastHitRoom;
+    for (int i = 0; i < MAX_SERVER_SLOTS; i++) {
+        if (!clientConnected[i] || clientRoom[i] != room) continue;
+        if (hostPlaysToo && i == 0) continue; /* host gets local path */
         SendFramed(clientSockets[i], MSG_HITCONFIRM, &confirm, sizeof(confirm));
     }
 }
@@ -1269,6 +1365,11 @@ static void ResolveHitEvent(HitEvent event) {
     event.direction.y /= dlen;
     event.direction.z /= dlen;
 
+    int room = (event.shooterId >= 0 && event.shooterId < MAX_SERVER_SLOTS)
+        ? clientRoom[event.shooterId] : -1;
+    if (room < 0) return;
+    lastHitRoom = room;
+
     // Стена по серверной карте. Если карты нет — occlusion выключен.
     float wallDist = ServerBlockRaycast(event.origin, event.direction, HITSCAN_RANGE);
 
@@ -1279,8 +1380,9 @@ static void ResolveHitEvent(HitEvent event) {
 
     float bestDist = HITSCAN_RANGE;
     int bestTarget = -1;
-    for (int i = 0; i < clientCount; i++) {
+    for (int i = 0; i < MAX_SERVER_SLOTS; i++) {
         if (i == event.shooterId || !clientConnected[i] || !clientStates[i].alive) continue;
+        if (clientRoom[i] != room) continue;
         if (clientSpawnProtect[i] > 0.0f || clientStates[i].spawnProtected)
             continue; /* защита спавна */
         /* friendly fire OFF */
@@ -1301,7 +1403,7 @@ static void ResolveHitEvent(HitEvent event) {
     }
 
     HitConfirm confirm;
-    confirm.shooterId = event.shooterId;
+    confirm.shooterId = clientLocalId[event.shooterId];
     if (bestTarget != -1) {
         // Базовый урон оружия + спад с дистанцией (как на клиенте)
         float base = (event.weaponType == 0) ? 25.0f : 35.0f;
@@ -1330,11 +1432,11 @@ static void ResolveHitEvent(HitEvent event) {
             (void)fromClient;
         }
         // Очки только в PLAYING
-        if (matchPhase == MATCH_PLAYING) {
+        if (rooms[room].phase == MATCH_PLAYING) {
             int pts = damage / MATCH_PTS_DAMAGE_DIV;
             if (pts < 1) pts = 1;
             int sf = clientStates[event.shooterId].faction;
-            if (sf == 0) scoreShield += pts; else scoreVolya += pts;
+            if (sf == 0) rooms[room].scoreShield += pts; else rooms[room].scoreVolya += pts;
         }
         clientStates[bestTarget].health -= damage;
         /* Потолок HP по фракции (Щит 110, Воля 100) — на случай хила/десинка */
@@ -1346,19 +1448,17 @@ static void ResolveHitEvent(HitEvent event) {
         if (clientStates[bestTarget].health <= 0) {
             clientStates[bestTarget].alive = false;
             clientStates[bestTarget].health = 0;
-            if (matchPhase == MATCH_PLAYING) {
+            if (rooms[room].phase == MATCH_PLAYING) {
                 int sf = clientStates[event.shooterId].faction;
-                if (sf == 0) scoreShield += MATCH_PTS_KILL; else scoreVolya += MATCH_PTS_KILL;
-                /* Килл + жетоны на серверном профиле стрелка */
+                if (sf == 0) rooms[room].scoreShield += MATCH_PTS_KILL; else rooms[room].scoreVolya += MATCH_PTS_KILL;
                 Profile_AddKill(event.shooterId);
             }
-            // В WAITING/COUNTDOWN — мгновенный респаун на сервере
-            if (matchPhase == MATCH_WAITING || matchPhase == MATCH_COUNTDOWN) {
+            if (rooms[room].phase == MATCH_WAITING || rooms[room].phase == MATCH_COUNTDOWN) {
                 clientStates[bestTarget].health = 100.0f;
                 clientStates[bestTarget].alive = true;
             }
         }
-        confirm.targetId = bestTarget;
+        confirm.targetId = (bestTarget >= 0) ? clientLocalId[bestTarget] : -1;
         confirm.damage = damage;
     } else {
         confirm.targetId = -1;
@@ -1391,13 +1491,17 @@ static void AcceptNewConnections(void) {
         SetNonBlocking(c);
         SetTcpNoDelay(c);
 
-        int base = hostPlaysToo ? 1 : 0;
-        int idx = -1;
-        for (int i = base; i < clientCount; i++) {
-            if (!clientConnected[i]) { idx = i; break; }
+        int room = PickRoomForJoin();
+        if (room < 0) {
+            printf("Server full (all rooms)\n");
+            closesocket(c);
+            continue;
         }
-        if (idx == -1 && clientCount < MAX_PLAYERS) idx = clientCount++;
-        if (idx == -1) { closesocket(c); continue; } // сервер полон
+        int idx = AllocSlotInRoom(room);
+        if (idx < 0) {
+            closesocket(c);
+            continue;
+        }
 
         clientSockets[idx] = c;
         clientConnected[idx] = true;
@@ -1406,12 +1510,16 @@ static void AcceptNewConnections(void) {
         clientLastSeen[idx] = Net_Now();
         clientNames[idx][0] = '\0';
         clientProfileIdx[idx] = -1;
-        rosterDirty = true; // новый игрок — сразу рассылаем snapshot
+        clientRoom[idx] = room;
+        clientLocalId[idx] = idx % MAX_PLAYERS;
+        if (idx + 1 > clientCount) clientCount = idx + 1;
+        rosterDirty = true;
 
-        WelcomeMsg w = { .assignedId = idx };
+        WelcomeMsg w = { .assignedId = clientLocalId[idx] };
         SendFramed(c, MSG_WELCOME, &w, sizeof(w));
-        SendMapInfo(c); // CRC+size — клиент решит, качать ли карту
-        printf("New client connected (id=%d)\n", idx);
+        SendMapInfo(c);
+        printf("Client id=%d room=%d local=%d (room players %d)\n",
+               idx, room, clientLocalId[idx], CountRoomPlayers(room));
     }
 }
 
@@ -1422,8 +1530,8 @@ bool Network_ReceiveSnapshot(GameSnapshot *snap) {
 
         AcceptNewConnections();
 
-        int base = hostPlaysToo ? 1 : 0;
-        for (int i = base; i < clientCount; i++) {
+        for (int i = 0; i < MAX_SERVER_SLOTS; i++) {
+            if (hostPlaysToo && i == 0) continue;
             if (!clientConnected[i]) continue;
             SOCKET cs = clientSockets[i];
 
@@ -1483,16 +1591,16 @@ bool Network_ReceiveSnapshot(GameSnapshot *snap) {
                 } else if (type == MSG_BOTSCORE && len == sizeof(BotScoreEvent)) {
                     BotScoreEvent bse;
                     memcpy(&bse, payload, sizeof(bse));
-                    ApplyBotScore(bse.faction, bse.points);
+                    ApplyBotScoreForRoom(clientRoom[i], bse.faction, bse.points);
                     gotAny = true;
                 } else if (type == MSG_STATUS_REQ) {
                     ServerStatusMsg st;
                     /* Не считаем сам probe-сокет в playerCount */
                     st.playerCount = CountConnectedPlayers();
-                    if (st.playerCount > 0) st.playerCount -= 1; /* текущий слот — probe */
+                    if (st.playerCount > 0) st.playerCount -= 1;
                     if (st.playerCount < 0) st.playerCount = 0;
-                    st.maxPlayers = MAX_PLAYERS;
-                    st.matchPhase = matchPhase;
+                    st.maxPlayers = MAX_SERVER_SLOTS;
+                    st.matchPhase = rooms[0].phase;
                     SendFramed(cs, MSG_STATUS, &st, sizeof(st));
                     /* Probe: сразу освобождаем слот, чтобы не занимать место игрока */
                     if (!clientNames[i][0]) {
@@ -1531,12 +1639,23 @@ bool Network_ReceiveSnapshot(GameSnapshot *snap) {
 
         ServerCheckTimeouts();
         MatchTick();
-        snap->playerCount = clientCount;
-        memcpy(snap->players, clientStates, sizeof(PlayerState) * clientCount);
-        snap->matchPhase = matchPhase;
-        snap->scoreShield = scoreShield;
-        snap->scoreVolya = scoreVolya;
-        snap->timeLeft = matchTimeLeft;
+        /* snap для host (рум 0); Broadcast шлёт каждому руму свой */
+        {
+            int r = hostPlaysToo ? 0 : 0;
+            memset(snap, 0, sizeof(*snap));
+            snap->matchPhase = rooms[r].phase;
+            snap->scoreShield = rooms[r].scoreShield;
+            snap->scoreVolya = rooms[r].scoreVolya;
+            snap->timeLeft = rooms[r].timeLeft;
+            int n = 0;
+            for (int local = 0; local < MAX_PLAYERS; local++) {
+                int g = r * MAX_PLAYERS + local;
+                if (!clientConnected[g]) continue;
+                snap->players[local] = clientStates[g];
+                if (local + 1 > n) n = local + 1;
+            }
+            snap->playerCount = n;
+        }
         // Обязательно вернуть true при смене состава, иначе disconnect
         // не дойдёт до клиентов и моделька «зависнет» на месте выхода.
         bool dirty = gotAny || rosterDirty || true; // матч-таймер всегда тикает
@@ -1624,11 +1743,31 @@ bool Network_ReceiveSnapshot(GameSnapshot *snap) {
 }
 
 void Network_BroadcastSnapshot(GameSnapshot snap) {
+    (void)snap;
     if (!isServer) return;
-    int base = hostPlaysToo ? 1 : 0;
-    for (int i = base; i < snap.playerCount; i++) {
-        if (!clientConnected[i]) continue;
-        SendFramed(clientSockets[i], MSG_SNAPSHOT, &snap, sizeof(snap));
+    for (int r = 0; r < MAX_ROOMS; r++) {
+        GameSnapshot out;
+        memset(&out, 0, sizeof(out));
+        out.matchPhase = rooms[r].phase;
+        out.scoreShield = rooms[r].scoreShield;
+        out.scoreVolya = rooms[r].scoreVolya;
+        out.timeLeft = rooms[r].timeLeft;
+        int n = 0;
+        /* pack by local id */
+        for (int local = 0; local < MAX_PLAYERS; local++) {
+            int g = r * MAX_PLAYERS + local;
+            if (!clientConnected[g]) continue;
+            out.players[local] = clientStates[g];
+            if (local + 1 > n) n = local + 1;
+        }
+        out.playerCount = n > 0 ? n : CountRoomPlayers(r);
+        if (CountRoomPlayers(r) == 0) continue;
+        for (int local = 0; local < MAX_PLAYERS; local++) {
+            int g = r * MAX_PLAYERS + local;
+            if (!clientConnected[g]) continue;
+            if (hostPlaysToo && g == 0) continue;
+            SendFramed(clientSockets[g], MSG_SNAPSHOT, &out, sizeof(out));
+        }
     }
 }
 

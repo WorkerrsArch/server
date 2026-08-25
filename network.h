@@ -13,7 +13,9 @@
     #include "raylib.h"
 #endif
 
-#define MAX_PLAYERS 8              // 4v4
+#define MAX_PLAYERS 8              // 4v4 в одном руме
+#define MAX_ROOMS 3                // скрытые параллельные матчи на dedicated
+#define MAX_SERVER_SLOTS (MAX_PLAYERS * MAX_ROOMS) /* 24 слота на сервере */
 #define SERVER_PORT 50000          // порт по умолчанию (он же "Internal Port" в Railway TCP Proxy)
 #define BUFFER_SIZE 4096
 #define CLIENT_TIMEOUT 5.0f
