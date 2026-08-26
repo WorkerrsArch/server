@@ -108,14 +108,16 @@ static int CountRoomPlayers(int r) {
         if (clientConnected[i] && clientRoom[i] == r) n++;
     return n;
 }
-/* Выбрать рум для новичка: WAITING/COUNTDOWN с местом → новый пустой → PLAYING с местом */
+/* Выбрать рум для новичка: сначала непустой WAITING/COUNTDOWN с местом
+ * (и как можно больше народу в нём - чтобы стягивать игроков в один рум,
+ * а не размазывать по нескольким), затем новый пустой, затем PLAYING с местом. */
 static int PickRoomForJoin(void) {
-    int bestWait = -1, bestWaitN = 999;
+    int bestWait = -1, bestWaitN = -1;
     for (int r = 0; r < MAX_ROOMS; r++) {
         int n = CountRoomPlayers(r);
-        if (n >= MAX_PLAYERS) continue;
+        if (n <= 0 || n >= MAX_PLAYERS) continue; // пустые - отдельная ветка ниже
         if (rooms[r].phase == MATCH_WAITING || rooms[r].phase == MATCH_COUNTDOWN) {
-            if (n < bestWaitN) { bestWaitN = n; bestWait = r; }
+            if (n > bestWaitN) { bestWaitN = n; bestWait = r; }
         }
     }
     if (bestWait >= 0) return bestWait;
