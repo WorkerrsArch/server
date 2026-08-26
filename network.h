@@ -170,6 +170,19 @@ const LeaderboardMsg *Network_GetCachedLeaderboard(void);
 /* Принудительно подтянуть лидерборд с официального/указанного адреса (короткая TCP-сессия) */
 bool Network_FetchLeaderboard(const char *addr, int timeoutMs, LeaderboardMsg *out);
 
+/* Неблокирующие версии (не стопорят кадр) — Start() один раз, затем Poll()
+ * каждый кадр, пока не вернёт не-NET_ASYNC_PENDING. Значения возврата:
+ * 0 = NET_ASYNC_IDLE (запрос не запущен), 1 = PENDING (ждём), 2 = DONE (готово),
+ * 3 = FAILED. */
+#define NET_ASYNC_IDLE    0
+#define NET_ASYNC_PENDING 1
+#define NET_ASYNC_DONE    2
+#define NET_ASYNC_FAILED  3
+void Network_LeaderboardFetchAsync_Start(const char *addr, int timeoutMs);
+int  Network_LeaderboardFetchAsync_Poll(LeaderboardMsg *out);
+void Network_StatusFetchAsync_Start(const char *addr, int timeoutMs);
+int  Network_StatusFetchAsync_Poll(int *outPlayerCount, int *outMaxPlayers);
+
 // Хост не проходит обычный цикл "отправил по сети -> получил из сокета",
 // поэтому свои же попадания и свой же авторитетный health/alive
 // ему нужно получать напрямую, в обход сокета. Используется только

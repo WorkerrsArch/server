@@ -416,6 +416,14 @@ static PlayerState clientStates[MAX_SERVER_SLOTS];
 /* clientConnected объявлен выше (рядом с clientRoom) */
 static double clientLastSeen[MAX_SERVER_SLOTS];
 static bool clientMapTransferring[MAX_SERVER_SLOTS];
+/* >0 = для probe-соединения (LB_REQ/STATUS_REQ) запланировано мягкое
+ * закрытие. Раньше сокет рвали closesocket() в тот же тик, что и отправку
+ * ответа - на голом Linux это обычно ок, но соединение идёт через Railway
+ * TCP proxy, и если апстрим-сокет закрывается раньше, чем прокси успевает
+ * дорелеить последний пакет клиенту, "хвост" ответа теряется. Даём чуть
+ * времени на фактическую доставку, слот освобождается по таймеру ниже
+ * (или раньше, обычным путём, если клиент сам отключился). */
+static double clientProbeCloseAt[MAX_SERVER_SLOTS];
 static char clientRecvBuf[MAX_SERVER_SLOTS][RECV_STREAM_BUF];
 static int clientRecvLen[MAX_SERVER_SLOTS];
 static int clientCount = 0; /* верхняя граница занятых global-слотов (не «число игроков») */
@@ -1278,6 +1286,186 @@ bool Network_FetchLeaderboard(const char *addr, int timeoutMs, LeaderboardMsg *o
     return got;
 }
 
+// ===================== Асинхронные probe-запросы =====================
+// Network_FetchLeaderboard/Network_ProbeServerEx блокируют вызывающий поток
+// на весь connect+recv (до timeoutMs*2 по факту - отдельный бюджет на коннект
+// и на ожидание ответа). Вызванные прямо из кадра рендера (UI_DrawLeaderboard)
+// они стопорят игру, а если это происходит во время реального матча - не
+// пампится основной игровой сокет, что рискует довести до собственного
+// разрыва по CLIENT_TIMEOUT. Ниже - версия без блокировки: Start() один раз,
+// Poll() каждый кадр, весь connect/send/recv неблокирующий и размазан по кадрам.
+// Коды состояния NET_ASYNC_* объявлены в network.h (общие с вызывающим кодом).
+
+typedef struct {
+    SOCKET sock;
+    int stage; // 0 = нет активного запроса, 1 = ждём connect(), 2 = ждём ответ
+    double deadline;
+    char rbuf[8192];
+    int rlen;
+    uint32_t reqType;
+    uint32_t wantType;
+    uint32_t wantLen; // 0 = любая длина
+    char resultPayload[BUFFER_SIZE];
+} AsyncNetReq;
+
+static void AsyncReq_Close(AsyncNetReq *r) {
+    if (r->sock != INVALID_SOCKET) { closesocket(r->sock); r->sock = INVALID_SOCKET; }
+    r->stage = 0;
+}
+
+static bool AsyncReq_ParseHostPort(const char *addr, char *host, size_t hostSz, int *outPort) {
+    int port = SERVER_PORT;
+    const char *colon = strrchr(addr, ':');
+    if (colon) {
+        size_t hostLen = (size_t)(colon - addr);
+        if (hostLen >= hostSz) hostLen = hostSz - 1;
+        memcpy(host, addr, hostLen);
+        host[hostLen] = '\0';
+        int p = atoi(colon + 1);
+        if (p > 0) port = p;
+    } else {
+        snprintf(host, hostSz, "%s", addr);
+    }
+    *outPort = port;
+    return true;
+}
+
+// Запускает новый неблокирующий запрос (обрывает предыдущий, если ещё не завершён).
+static void AsyncReq_Start(AsyncNetReq *r, const char *addr, uint32_t reqType,
+                            uint32_t wantType, uint32_t wantLen, int timeoutMs) {
+    AsyncReq_Close(r);
+    if (!addr || !InitSockets()) return;
+
+    char host[128]; int port;
+    AsyncReq_ParseHostPort(addr, host, sizeof(host), &port);
+
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    char portStr[16];
+    snprintf(portStr, sizeof(portStr), "%d", port);
+    // getaddrinfo() сам по себе блокирующий (DNS) и не покрыт timeoutMs -
+    // на мобильной сети иногда даёт основную часть задержки. Отдельного
+    // неблокирующего резолвера тут нет, но это не более 8К символов кода
+    // ради разовой асинхронности DNS; дальнейший connect/recv уже честно
+    // размазаны по кадрам.
+    if (getaddrinfo(host, portStr, &hints, &res) != 0 || !res) return;
+
+    SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s == INVALID_SOCKET) { freeaddrinfo(res); return; }
+    SetNonBlocking(s);
+    int rc = connect(s, res->ai_addr, (int)res->ai_addrlen);
+    freeaddrinfo(res);
+
+    bool inProgress;
+#ifdef _WIN32
+    if (rc != 0 && WSAGetLastError() != WSAEWOULDBLOCK) { closesocket(s); return; }
+#else
+    if (rc != 0 && errno != EINPROGRESS) { closesocket(s); return; }
+#endif
+    inProgress = (rc != 0);
+
+    r->sock = s;
+    r->reqType = reqType;
+    r->wantType = wantType;
+    r->wantLen = wantLen;
+    r->rlen = 0;
+    r->deadline = Net_Now() + (timeoutMs > 0 ? timeoutMs / 1000.0 : 2.0);
+    if (inProgress) {
+        r->stage = 1;
+    } else {
+        // мгновенный коннект (localhost и т.п.) - шлём запрос сразу
+        SetTcpNoDelay(s);
+        SendFramed(s, reqType, NULL, 0);
+        r->stage = 2;
+    }
+}
+
+// 0 = ещё ждём, 1 = получили нужный ответ (resultPayload заполнен), -1 = провал/таймаут
+static int AsyncReq_Poll(AsyncNetReq *r) {
+    if (r->stage == 0) return -1;
+    if (Net_Now() > r->deadline) { AsyncReq_Close(r); return -1; }
+
+    if (r->stage == 1) {
+        fd_set wf, ef;
+        FD_ZERO(&wf); FD_ZERO(&ef);
+        FD_SET(r->sock, &wf);
+        FD_SET(r->sock, &ef);
+        struct timeval tv = {0, 0}; // неблокирующий опрос — не ждём внутри select()
+        int sel = select((int)r->sock + 1, NULL, &wf, &ef, &tv);
+        if (sel > 0) {
+            int err = 0;
+            socklen_t elen = sizeof(err);
+            getsockopt(r->sock, SOL_SOCKET, SO_ERROR, (char*)&err, &elen);
+            if (err != 0 || FD_ISSET(r->sock, &ef)) { AsyncReq_Close(r); return -1; }
+            if (FD_ISSET(r->sock, &wf)) {
+                SetTcpNoDelay(r->sock);
+                SendFramed(r->sock, r->reqType, NULL, 0);
+                r->stage = 2;
+            }
+        }
+        return 0;
+    }
+
+    // stage == 2: ждём ответ
+    if (!PumpRecv(r->sock, r->rbuf, &r->rlen)) { AsyncReq_Close(r); return -1; }
+    uint32_t type, len;
+    while (TryParseFrame(r->rbuf, &r->rlen, &type, r->resultPayload, sizeof(r->resultPayload), &len)) {
+        if (type == r->wantType && (r->wantLen == 0 || len == r->wantLen)) {
+            AsyncReq_Close(r);
+            return 1;
+        }
+        // WELCOME/MAP_INFO от полноценного accept - игнор, ждём нужный тип дальше
+    }
+    return 0;
+}
+
+static AsyncNetReq g_lbAsyncReq = { .sock = INVALID_SOCKET };
+static bool g_lbAsyncInFlight = false;
+
+void Network_LeaderboardFetchAsync_Start(const char *addr, int timeoutMs) {
+    AsyncReq_Start(&g_lbAsyncReq, addr, MSG_LB_REQ, MSG_LB_DATA, sizeof(LeaderboardMsg), timeoutMs);
+    g_lbAsyncInFlight = (g_lbAsyncReq.stage != 0);
+}
+
+int Network_LeaderboardFetchAsync_Poll(LeaderboardMsg *out) {
+    if (!g_lbAsyncInFlight) return NET_ASYNC_IDLE;
+    int r = AsyncReq_Poll(&g_lbAsyncReq);
+    if (r == 0) return NET_ASYNC_PENDING;
+    g_lbAsyncInFlight = false;
+    if (r == 1 && out) {
+        memcpy(out, g_lbAsyncReq.resultPayload, sizeof(LeaderboardMsg));
+        cachedLeaderboard = *out;
+        hasCachedLeaderboard = true;
+        return NET_ASYNC_DONE;
+    }
+    return NET_ASYNC_FAILED;
+}
+
+static AsyncNetReq g_stAsyncReq = { .sock = INVALID_SOCKET };
+static bool g_stAsyncInFlight = false;
+
+void Network_StatusFetchAsync_Start(const char *addr, int timeoutMs) {
+    AsyncReq_Start(&g_stAsyncReq, addr, MSG_STATUS_REQ, MSG_STATUS, sizeof(ServerStatusMsg), timeoutMs);
+    g_stAsyncInFlight = (g_stAsyncReq.stage != 0);
+}
+
+int Network_StatusFetchAsync_Poll(int *outPlayerCount, int *outMaxPlayers) {
+    if (!g_stAsyncInFlight) return NET_ASYNC_IDLE;
+    int r = AsyncReq_Poll(&g_stAsyncReq);
+    if (r == 0) return NET_ASYNC_PENDING;
+    g_stAsyncInFlight = false;
+    if (r == 1) {
+        ServerStatusMsg st;
+        memcpy(&st, g_stAsyncReq.resultPayload, sizeof(st));
+        if (outPlayerCount) *outPlayerCount = st.playerCount;
+        if (outMaxPlayers) *outMaxPlayers = st.maxPlayers > 0 ? st.maxPlayers : MAX_PLAYERS;
+        return NET_ASYNC_DONE;
+    }
+    return NET_ASYNC_FAILED;
+}
+
 void Network_SendState(PlayerState state) {
     if (isServer) {
         if (!hostPlaysToo) return; // dedicated-сервер сам не играет
@@ -1324,6 +1512,7 @@ static void ClearClientSlot(int i) {
     clientProfileIdx[i] = -1;
     clientRoom[i] = -1;
     clientLocalId[i] = -1;
+    clientProbeCloseAt[i] = 0.0;
     rosterDirty = true;
 }
 
@@ -1331,9 +1520,17 @@ static void ServerCheckTimeouts(void) {
     double now = Net_Now();
     for (int i = 0; i < MAX_SERVER_SLOTS; i++) {
         if (hostPlaysToo && i == 0) continue;
+        if (!clientConnected[i]) continue;
+        // Мягкое закрытие probe-соединений (LB_REQ/STATUS_REQ) - см.
+        // clientProbeCloseAt: ответ уже отправлен, ждём, дадим сети время
+        // фактически его доставить перед закрытием сокета.
+        if (clientProbeCloseAt[i] > 0.0 && now > clientProbeCloseAt[i]) {
+            ClearClientSlot(i);
+            continue;
+        }
         // Пока клиент качает карту (~18 МБ), STATE не шлёт — таймаут 5с убивал
         // соединение на последних килобайтах (см. "connection lost at 18370560/...").
-        if (!clientConnected[i] || clientMapTransferring[i]) continue;
+        if (clientMapTransferring[i]) continue;
         if (now - clientLastSeen[i] > CLIENT_TIMEOUT) {
             printf("Client %d timed out, disconnecting\n", i);
             ClearClientSlot(i);
@@ -1602,10 +1799,10 @@ bool Network_ReceiveSnapshot(GameSnapshot *snap) {
                     st.maxPlayers = MAX_SERVER_SLOTS;
                     st.matchPhase = rooms[0].phase;
                     SendFramed(cs, MSG_STATUS, &st, sizeof(st));
-                    /* Probe: сразу освобождаем слот, чтобы не занимать место игрока */
+                    /* Probe: слот всё равно не держим долго, но не рвём
+                     * сокет в этот же тик - см. clientProbeCloseAt выше. */
                     if (!clientNames[i][0]) {
-                        ClearClientSlot(i);
-                        break;
+                        clientProbeCloseAt[i] = Net_Now() + 0.5;
                     }
                 } else if (type == MSG_PROFILE_LOGIN && len == sizeof(ProfileLoginMsg)) {
                     ProfileLoginMsg pl;
@@ -1628,10 +1825,10 @@ bool Network_ReceiveSnapshot(GameSnapshot *snap) {
                     LeaderboardMsg lb;
                     Profile_BuildLeaderboard(&lb);
                     SendFramed(cs, MSG_LB_DATA, &lb, sizeof(lb));
-                    /* Короткий fetch без профиля — не держим слот */
+                    /* Короткий fetch без профиля — слот не держим долго,
+                     * но не рвём сокет в этот же тик - см. clientProbeCloseAt. */
                     if (!clientNames[i][0]) {
-                        ClearClientSlot(i);
-                        break;
+                        clientProbeCloseAt[i] = Net_Now() + 0.5;
                     }
                 }
             }
