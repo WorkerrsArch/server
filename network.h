@@ -17,6 +17,8 @@
 #define MAX_ROOMS 3                // скрытые параллельные матчи на dedicated
 #define MAX_SERVER_SLOTS (MAX_PLAYERS * MAX_ROOMS) /* 24 слота на сервере */
 #define SERVER_PORT 50000          // порт по умолчанию (он же "Internal Port" в Railway TCP Proxy)
+/* Макс. число зарегистрированных аккаунтов (ников) с одного IP. */
+#define MAX_ACCOUNTS_PER_IP 8
 /* Должен вмещать LeaderboardMsg (Топ-100): count(4) + 100 * LeaderboardEntry(48) = 4804 байта.
  * Берём с запасом на случай роста LEADERBOARD_TOP / полей. */
 #define BUFFER_SIZE 8192
@@ -112,6 +114,9 @@ typedef struct {
     int tokens;
     int kills;
     int rank; /* 1..N, 0 если вне топа */
+    /* 0 = ок; 1 = ник уже в игре у другого игрока; 2 = лимит аккаунтов
+     * с этого IP (см. MAX_ACCOUNTS_PER_IP) */
+    int rejected;
 } ProfileInfoMsg;
 
 typedef struct {
