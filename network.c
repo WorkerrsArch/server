@@ -60,6 +60,7 @@ typedef enum {
     MSG_PROFILE_INFO  = 17, // сервер -> клиент: ProfileInfoMsg
     MSG_LB_REQ     = 18, // клиент -> сервер: запрос топ-100
     MSG_LB_DATA    = 19, // сервер -> клиент: LeaderboardMsg
+    MSG_SPAWN_CFG  = 20, // сервер -> клиент: текст spawn_points.cfg (UTF-8, без нуля)
 } MsgType;
 
 #define RECV_STREAM_BUF 16384
@@ -346,21 +347,30 @@ static unsigned char *mapFileData = NULL;
 static uint32_t mapFileSize = 0;
 static uint32_t mapFileCrc = 0;
 
+/* spawn_points.cfg с dedicated/listen-сервера — приоритет над клиентским файлом */
+#define SPAWN_CFG_MAX (64 * 1024)
+static char *spawnCfgData = NULL;
+static uint32_t spawnCfgSize = 0;
+#define NETWORK_SPAWN_SERVER_PATH "server_spawn_points.cfg"
+#define NETWORK_SPAWN_LOCAL_PATH  "spawn_points.cfg"
+
 // Сетка блоков для серверного raycast (анти-wallhack).
-// Размеры совпадают с world.h (WORLD_X/Y/Z). Порядок в файле: x, z, y.
-#define SRV_WX 350
-#define SRV_WY 150
-#define SRV_WZ 350
+// Макс. размеры = WORLD_* в world.h. Фактический размер — из заголовка карты.
+// Любая карта dims <= MAX работает без правки кода.
+#define SRV_MAX_X 350
+#define SRV_MAX_Y 150
+#define SRV_MAX_Z 350
 #define SRV_AIR ((signed char)-1)
 static signed char *srvBlocks = NULL;
 static int srvMapReady = 0;
+static int srvWX = 0, srvWY = 0, srvWZ = 0;
 
 static inline int SrvBlockIndex(int x, int y, int z) {
-    return (x * SRV_WZ + z) * SRV_WY + y;
+    return (x * srvWZ + z) * srvWY + y;
 }
 
 static inline signed char SrvGetBlock(int x, int y, int z) {
-    if (x < 0 || x >= SRV_WX || y < 0 || y >= SRV_WY || z < 0 || z >= SRV_WZ)
+    if (!srvMapReady || x < 0 || x >= srvWX || y < 0 || y >= srvWY || z < 0 || z >= srvWZ)
         return SRV_AIR;
     return srvBlocks[SrvBlockIndex(x, y, z)];
 }
@@ -368,6 +378,7 @@ static inline signed char SrvGetBlock(int x, int y, int z) {
 static void ServerFreeBlockGrid(void) {
     if (srvBlocks) { free(srvBlocks); srvBlocks = NULL; }
     srvMapReady = 0;
+    srvWX = srvWY = srvWZ = 0;
 }
 
 // Разобрать mapFileData → srvBlocks (формат World_Save/World_Load).
@@ -379,9 +390,10 @@ static void ServerBuildBlockGrid(void) {
     memcpy(&hx, mapFileData + 0, 4);
     memcpy(&hy, mapFileData + 4, 4);
     memcpy(&hz, mapFileData + 8, 4);
-    if (hx != SRV_WX || hy != SRV_WY || hz != SRV_WZ) {
-        printf("Map dims %dx%dx%d != server %dx%dx%d — raycast off\n",
-               hx, hy, hz, SRV_WX, SRV_WY, SRV_WZ);
+    if (hx <= 0 || hy <= 0 || hz <= 0 ||
+        hx > SRV_MAX_X || hy > SRV_MAX_Y || hz > SRV_MAX_Z) {
+        printf("Map dims %dx%dx%d out of range (max %dx%dx%d) — raycast off\n",
+               hx, hy, hz, SRV_MAX_X, SRV_MAX_Y, SRV_MAX_Z);
         return;
     }
     size_t voxels = (size_t)hx * (size_t)hy * (size_t)hz;
@@ -392,6 +404,7 @@ static void ServerBuildBlockGrid(void) {
     srvBlocks = (signed char *)malloc(voxels);
     if (!srvBlocks) return;
 
+    srvWX = hx; srvWY = hy; srvWZ = hz;
     const unsigned char *p = mapFileData + 12;
     for (int x = 0; x < hx; x++)
         for (int z = 0; z < hz; z++)
@@ -400,7 +413,8 @@ static void ServerBuildBlockGrid(void) {
                 srvBlocks[SrvBlockIndex(x, y, z)] = (signed char)(*p++);
             }
     srvMapReady = 1;
-    printf("Server block grid ready (%zu voxels) — wall occlusion ON\n", voxels);
+    printf("Server block grid ready %dx%dx%d (%zu voxels) — wall occlusion ON\n",
+           hx, hy, hz, voxels);
 }
 
 // DDA по вокселям (как World_Raycast). Возвращает t до первого solid-блока,
@@ -427,7 +441,7 @@ static float ServerBlockRaycast(Vector3 o, Vector3 d, float maxDist) {
 
     // если стартуем внутри solid (редкий глюк) — игнорируем первую клетку
     int steps = 0;
-    const int maxSteps = SRV_WX + SRV_WY + SRV_WZ + 8;
+    const int maxSteps = srvWX + srvWY + srvWZ + 8;
     while (t < maxDist && steps++ < maxSteps) {
         if (SrvGetBlock(x, y, z) != SRV_AIR) {
             // первая клетка с t≈0 — стрелок внутри блока, пропускаем
@@ -790,6 +804,41 @@ static uint32_t Crc32Path(const char *path, uint32_t *outSize) {
     return ~crc;
 }
 
+static void Network_LoadSpawnCfg(void) {
+    if (spawnCfgData) { free(spawnCfgData); spawnCfgData = NULL; }
+    spawnCfgSize = 0;
+    /* Сначала spawn_points.cfg рядом с бинарником (dedicated), иначе тот же путь */
+    const char *paths[] = { NETWORK_SPAWN_LOCAL_PATH, NULL };
+    for (int i = 0; paths[i]; i++) {
+        FILE *f = fopen(paths[i], "rb");
+        if (!f) continue;
+        if (fseek(f, 0, SEEK_END) != 0) { fclose(f); continue; }
+        long sz = ftell(f);
+        if (sz <= 0 || sz > SPAWN_CFG_MAX) { fclose(f); continue; }
+        if (fseek(f, 0, SEEK_SET) != 0) { fclose(f); continue; }
+        spawnCfgData = (char *)malloc((size_t)sz + 1);
+        if (!spawnCfgData) { fclose(f); continue; }
+        if (fread(spawnCfgData, 1, (size_t)sz, f) != (size_t)sz) {
+            free(spawnCfgData); spawnCfgData = NULL; fclose(f); continue;
+        }
+        fclose(f);
+        spawnCfgData[sz] = '\0';
+        spawnCfgSize = (uint32_t)sz;
+        printf("Spawn cfg loaded for serving: %s (%u bytes)\n", paths[i], spawnCfgSize);
+        return;
+    }
+    printf("No spawn_points.cfg on server — clients keep local\n");
+}
+
+static void SendSpawnCfg(SOCKET s) {
+    if (!spawnCfgData || spawnCfgSize == 0) {
+        /* пустой payload = у сервера нет своего cfg */
+        SendFramed(s, MSG_SPAWN_CFG, NULL, 0);
+        return;
+    }
+    SendFramed(s, MSG_SPAWN_CFG, spawnCfgData, spawnCfgSize);
+}
+
 bool Network_LoadMapFile(const char *path) {
     if (mapFileData) { free(mapFileData); mapFileData = NULL; }
     mapFileSize = 0;
@@ -819,6 +868,7 @@ bool Network_LoadMapFile(const char *path) {
     mapFileCrc = Crc32FileBuffer(mapFileData, mapFileSize);
     printf("Map loaded for serving: %s (%u bytes, crc=0x%08X)\n", path, mapFileSize, mapFileCrc);
     ServerBuildBlockGrid();
+    Network_LoadSpawnCfg();
     return true;
 }
 
@@ -860,6 +910,27 @@ static void SendMapChunks(SOCKET s) {
     printf("Map fully sent (%u bytes)\n", mapFileSize);
 }
 
+/* Клиент: применить spawn_points.cfg с сервера (приоритет над локальным). */
+static void ClientApplySpawnCfg(const char *data, uint32_t len) {
+    if (!data || len == 0) {
+        remove(NETWORK_SPAWN_SERVER_PATH);
+        printf("Server has no spawn_points.cfg — using local if any\n");
+        return;
+    }
+    FILE *out = fopen(NETWORK_SPAWN_SERVER_PATH, "wb");
+    if (!out) {
+        printf("Failed to write %s\n", NETWORK_SPAWN_SERVER_PATH);
+        return;
+    }
+    fwrite(data, 1, len, out);
+    fclose(out);
+    printf("Server spawn_points.cfg saved (%u bytes) — priority over local\n", len);
+#ifndef NETWORK_HEADLESS_BUILD
+    extern void SpawnEdit_Load(void);
+    SpawnEdit_Load();
+#endif
+}
+
 // Клиент: дождаться WELCOME+MAP_INFO, сверить CRC с кэшем, при необходимости скачать.
 static bool ClientSyncMap(void) {
     bool gotWelcome = false;
@@ -881,6 +952,8 @@ static bool ClientSyncMap(void) {
                 memcpy(&remoteCrc, payload, 4);
                 memcpy(&remoteSize, payload + 4, 4);
                 gotMapInfo = true;
+            } else if (type == MSG_SPAWN_CFG) {
+                ClientApplySpawnCfg(payload, len);
             }
         }
 #ifdef _WIN32
@@ -953,6 +1026,8 @@ static bool ClientSyncMap(void) {
             } else if (type == MSG_WELCOME && len == sizeof(WelcomeMsg)) {
                 WelcomeMsg w; memcpy(&w, payload, sizeof(w));
                 myId = w.assignedId;
+            } else if (type == MSG_SPAWN_CFG) {
+                ClientApplySpawnCfg(payload, len);
             }
         }
 
@@ -1046,6 +1121,8 @@ bool Network_InitDedicatedServer(int port) {
     myId = -1;      // у dedicated-сервера нет своего игрока
     clientCount = 0;
     Network_LoadMapFile(NETWORK_MAP_DEDICATED_PATH);
+    /* если карты нет — всё равно подхватить spawn_points.cfg */
+    if (!spawnCfgData) Network_LoadSpawnCfg();
     printf("Dedicated TCP server started on port %d\n", port);
     return true;
 }
@@ -1755,6 +1832,7 @@ static void AcceptNewConnections(void) {
         WelcomeMsg w = { .assignedId = clientLocalId[idx] };
         SendFramed(c, MSG_WELCOME, &w, sizeof(w));
         SendMapInfo(c);
+        SendSpawnCfg(c);
         printf("Client id=%d room=%d local=%d (room players %d)\n",
                idx, room, clientLocalId[idx], CountRoomPlayers(room));
     }
