@@ -31,7 +31,7 @@
  * Убийство = MATCH_PTS_KILL, урон даёт мелкие очки. */
 #define MATCH_SCORE_WIN      150
 #define MATCH_ROUND_SEC      600.0f   /* 10 минут на раунд */
-#define MATCH_WAIT_SEC       20.0f    /* countdown перед стартом */
+#define MATCH_WAIT_SEC       15.0f    /* countdown перед стартом (нужны люди в обеих фракциях) */
 #define MATCH_END_HOLD_SEC   15.0f    /* экран итога, потом новый цикл */
 #define MATCH_PTS_KILL       15
 #define MATCH_PTS_DAMAGE_DIV 5
@@ -156,6 +156,14 @@ bool Network_ReceiveHitConfirm(HitConfirm *confirm);
 // поэтому при isServer==true очки применяются к авторитетному счёту напрямую).
 void Network_SendBotScore(int faction, int points);
 void Network_Close(void);
+/* LAN: локальный IP хоста и UDP-маяк (не для dedicated) */
+bool Network_GetLocalIPv4(char *out, int outMax);
+void Network_LanBeaconStart(int gamePort); /* Wi-Fi host only */
+void Network_LanBeaconStop(void);
+void Network_LanBeaconTick(void);
+/* Скан LAN: пишет в outAddrs[i] "ip:port", возвращает число (max maxOut) */
+int  Network_LanDiscover(char outAddrs[][64], int maxOut, int timeoutMs);
+
 int  Network_GetMyId(void);
 float Network_GetPing(void);
 void Network_SeedPing(float ms); // начальный пинг из probe списка серверов

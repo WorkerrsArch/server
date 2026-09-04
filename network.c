@@ -21,6 +21,8 @@
     #pragma comment(lib, "ws2_32.lib")
 #else
     #include <arpa/inet.h>
+#include <ifaddrs.h>
+#include <net/if.h>
     #include <sys/socket.h>
     #include <sys/select.h>   // select() для ConnectWithTimeout
     #include <sys/stat.h>     // mkdir
@@ -126,25 +128,23 @@ static int CountFactionInRoom(int room, int faction) {
     }
     return n;
 }
-/* Автобаланс: вернуть фракцию с меньшим числом игроков (0=Щит, 1=Воля). */
+/* Автобаланс: вернуть фракцию с меньшим числом игроков (0=Щит/Долг, 1=Воля). */
 static int SuggestFactionForRoom(int room) {
     int s = CountFactionInRoom(room, 0);
     int v = CountFactionInRoom(room, 1);
     return (s <= v) ? 0 : 1;
 }
-/* Если выбор клиента разбалансирует больше чем на 1 — принудительно.
- * Вызывать при приёме STATE от клиента в руме. */
+/* Жёсткий баланс: |S-V| <= 1 всегда.
+ * Иначе двое в Долге → матч против ботов Воли → фарм жетонов.
+ * Вызывающий перед вызовом ставит faction=-1, чтобы себя не считать. */
 static int BalanceFaction(int room, int wanted) {
-    if (wanted != 0 && wanted != 1) wanted = SuggestFactionForRoom(room);
     int s = CountFactionInRoom(room, 0);
     int v = CountFactionInRoom(room, 1);
-    /* не считаем самого клиента в wanted, если он уже в этой фракции —
-     * вызывающий передаёт wanted до записи в clientStates. */
-    if (wanted == 0) {
-        if (s > v + 1) return 1; /* Щит переполнен */
-    } else {
-        if (v > s + 1) return 0;
-    }
+    if (wanted != 0 && wanted != 1)
+        return SuggestFactionForRoom(room);
+    /* пустая вражеская сторона при уже занятой своей — кидаем во врагов */
+    if (wanted == 0 && s >= v + 1) return 1;
+    if (wanted == 1 && v >= s + 1) return 0;
     return wanted;
 }
 static void Rooms_TrimEmpty(void) {
@@ -632,6 +632,7 @@ static void MatchStartPlayingRoom(int r) {
     printf("Room %d: PLAYING (%d players)\n", r, CountRoomPlayers(r));
 }
 static void MatchTick(void) {
+    Network_LanBeaconTick();
     double now = Net_Now();
     for (int i = 0; i < MAX_SERVER_SLOTS; i++) {
         if (!clientConnected[i]) continue;
@@ -656,15 +657,22 @@ static void MatchTick(void) {
         }
         if (rooms[r].phase == MATCH_WAITING) {
             rooms[r].timeLeft = 0.f;
-            if (n >= 2) {
+            /* Старт только если есть живые люди в ОБЕИХ фракциях (мин. 1v1).
+             * Двое в одном Долге больше не запускают раунд против ботов. */
+            int nS = CountFactionInRoom(r, 0);
+            int nV = CountFactionInRoom(r, 1);
+            if (n >= 2 && nS >= 1 && nV >= 1) {
                 rooms[r].phase = MATCH_COUNTDOWN;
                 rooms[r].timeLeft = MATCH_WAIT_SEC;
-                printf("Room %d: COUNTDOWN (%d players)\n", r, n);
+                printf("Room %d: COUNTDOWN (%d players, S=%d V=%d)\n", r, n, nS, nV);
             }
         } else if (rooms[r].phase == MATCH_COUNTDOWN) {
-            if (n < 2) {
+            int nS = CountFactionInRoom(r, 0);
+            int nV = CountFactionInRoom(r, 1);
+            if (n < 2 || nS < 1 || nV < 1) {
                 rooms[r].phase = MATCH_WAITING;
                 rooms[r].timeLeft = 0.f;
+                printf("Room %d: countdown cancelled (need both factions, S=%d V=%d)\n", r, nS, nV);
             } else {
                 rooms[r].timeLeft -= dt;
                 if (rooms[r].timeLeft <= 0.f) MatchStartPlayingRoom(r);
@@ -2269,6 +2277,7 @@ void Network_SeedPing(float ms) {
 }
 
 void Network_Close(void) {
+    Network_LanBeaconStop();
     if (isServer) {
         int base = hostPlaysToo ? 1 : 0;
         for (int i = base; i < MAX_SERVER_SLOTS; i++) {
@@ -2295,4 +2304,139 @@ void Network_Close(void) {
 #ifdef _WIN32
     WSACleanup();
 #endif
+}
+
+
+/* ===================== LAN discovery (Wi-Fi host only) ===================== */
+#define LAN_BEACON_PORT 50001
+#define LAN_MAGIC "MR01"
+static SOCKET g_beaconSock = INVALID_SOCKET;
+static int g_beaconGamePort = 0;
+static double g_beaconLast = 0.0;
+
+bool Network_GetLocalIPv4(char *out, int outMax) {
+    if (!out || outMax < 8) return false;
+    out[0] = '\0';
+#if defined(_WIN32)
+    char host[256];
+    if (gethostname(host, sizeof(host)) != 0) return false;
+    struct hostent *he = gethostbyname(host);
+    if (!he || !he->h_addr_list[0]) return false;
+    struct in_addr addr;
+    memcpy(&addr, he->h_addr_list[0], sizeof(addr));
+    const char *s = inet_ntoa(addr);
+    if (!s) return false;
+    snprintf(out, outMax, "%s", s);
+    return true;
+#else
+    struct ifaddrs *ifaddr = NULL;
+    if (getifaddrs(&ifaddr) != 0) return false;
+    bool ok = false;
+    for (struct ifaddrs *ifa = ifaddr; ifa; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) continue;
+        if (!(ifa->ifa_flags & IFF_UP) || (ifa->ifa_flags & IFF_LOOPBACK)) continue;
+        struct sockaddr_in *sin = (struct sockaddr_in *)ifa->ifa_addr;
+        const char *s = inet_ntoa(sin->sin_addr);
+        if (!s || strncmp(s, "127.", 4) == 0) continue;
+        snprintf(out, outMax, "%s", s);
+        ok = true;
+        break;
+    }
+    freeifaddrs(ifaddr);
+    return ok;
+#endif
+}
+
+void Network_LanBeaconStop(void) {
+    if (g_beaconSock != INVALID_SOCKET) {
+        closesocket(g_beaconSock);
+        g_beaconSock = INVALID_SOCKET;
+    }
+    g_beaconGamePort = 0;
+}
+
+void Network_LanBeaconStart(int gamePort) {
+    Network_LanBeaconStop();
+    if (!InitSockets()) return;
+    g_beaconGamePort = gamePort > 0 ? gamePort : SERVER_PORT;
+    g_beaconSock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (g_beaconSock == INVALID_SOCKET) return;
+    int yes = 1;
+    setsockopt(g_beaconSock, SOL_SOCKET, SO_BROADCAST, (const char *)&yes, sizeof(yes));
+    SetNonBlocking(g_beaconSock);
+    g_beaconLast = 0.0;
+    printf("LAN beacon on UDP %d (game port %d)\n", LAN_BEACON_PORT, g_beaconGamePort);
+}
+
+void Network_LanBeaconTick(void) {
+    if (g_beaconSock == INVALID_SOCKET || g_beaconGamePort <= 0) return;
+    double now = Net_Now();
+    if (g_beaconLast > 0.0 && (now - g_beaconLast) < 1.5) return;
+    g_beaconLast = now;
+    char msg[32];
+    snprintf(msg, sizeof(msg), "%s:%d", LAN_MAGIC, g_beaconGamePort);
+    struct sockaddr_in dst;
+    memset(&dst, 0, sizeof(dst));
+    dst.sin_family = AF_INET;
+    dst.sin_port = htons(LAN_BEACON_PORT);
+    dst.sin_addr.s_addr = htonl(0xFFFFFFFFu); /* 255.255.255.255 */
+    sendto(g_beaconSock, msg, (int)strlen(msg), 0, (struct sockaddr *)&dst, sizeof(dst));
+}
+
+int Network_LanDiscover(char outAddrs[][64], int maxOut, int timeoutMs) {
+    if (!outAddrs || maxOut <= 0) return 0;
+    if (!InitSockets()) return 0;
+    SOCKET s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s == INVALID_SOCKET) return 0;
+    int yes = 1;
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (const char *)&yes, sizeof(yes));
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(LAN_BEACON_PORT);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (bind(s, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        closesocket(s);
+        return 0;
+    }
+    SetNonBlocking(s);
+    double deadline = Net_Now() + (timeoutMs > 0 ? timeoutMs : 800) / 1000.0;
+    int n = 0;
+    while (Net_Now() < deadline && n < maxOut) {
+        char buf[64];
+        struct sockaddr_in from;
+        socklen_t flen = sizeof(from);
+        int r = (int)recvfrom(s, buf, sizeof(buf) - 1, 0, (struct sockaddr *)&from, &flen);
+        if (r > 0) {
+            buf[r] = '\0';
+            if (strncmp(buf, LAN_MAGIC, 4) == 0) {
+                int port = SERVER_PORT;
+                const char *col = strchr(buf, ':');
+                if (col) port = atoi(col + 1);
+                if (port <= 0) port = SERVER_PORT;
+                char ip[32];
+                const char *ips = inet_ntoa(from.sin_addr);
+                if (!ips) continue;
+                snprintf(ip, sizeof(ip), "%s", ips);
+                if (strncmp(ip, "127.", 4) == 0) continue;
+                char entry[64];
+                snprintf(entry, sizeof(entry), "%s:%d", ip, port);
+                int dup = 0;
+                for (int i = 0; i < n; i++) if (strcmp(outAddrs[i], entry) == 0) { dup = 1; break; }
+                if (!dup) {
+                    snprintf(outAddrs[n], 64, "%s", entry);
+                    n++;
+                }
+            }
+        } else {
+#ifdef _WIN32
+            Sleep(20);
+#else
+            struct timespec ts = {0, 20 * 1000 * 1000};
+            nanosleep(&ts, NULL);
+#endif
+        }
+    }
+    closesocket(s);
+    return n;
 }
