@@ -84,6 +84,7 @@ static int clientLocalId[MAX_SERVER_SLOTS];    /* 0..MAX_PLAYERS-1 в руме *
 static int myRoomId = 0;                      /* клиент: свой рум (скрыт от UI) */
 /* объявлены ниже полностью; здесь — чтобы CountRoomPlayers/Alloc видели */
 static bool clientConnected[MAX_SERVER_SLOTS];
+static PlayerState clientStates[MAX_SERVER_SLOTS]; /* early: for CountFactionInRoom */
 static int lastHitRoom = 0;
 
 static int   clientMatchPhase = MATCH_WAITING;
@@ -91,7 +92,14 @@ static int   clientScoreShield = 0, clientScoreVolya = 0;
 static float clientTimeLeft = 0.0f;
 
 static void MatchTick(void);
+/* Сколько румов реально «открыто» (0..MAX_ROOMS-1).
+ * Румы 0..roomsOpen-1 принимают игроков; остальные ждут.
+ * При заполнении всех открытых — roomsOpen++ (макс MAX_ROOMS=6).
+ * Пустые хвостовые румы схлопываются, чтобы не держать лишнее. */
+static int roomsOpen = 1;
+
 static void Rooms_Init(void) {
+    roomsOpen = 1;
     for (int r = 0; r < MAX_ROOMS; r++) {
         rooms[r].phase = MATCH_WAITING;
         rooms[r].scoreShield = rooms[r].scoreVolya = 0;
@@ -102,6 +110,7 @@ static void Rooms_Init(void) {
         clientRoom[i] = -1;
         clientLocalId[i] = -1;
     }
+    printf("Rooms_Init: open=%d max=%d slots=%d\n", roomsOpen, MAX_ROOMS, MAX_SERVER_SLOTS);
 }
 static int CountRoomPlayers(int r) {
     int n = 0;
@@ -109,20 +118,79 @@ static int CountRoomPlayers(int r) {
         if (clientConnected[i] && clientRoom[i] == r) n++;
     return n;
 }
-/* Выбрать рум для новичка: сначала непустой WAITING/COUNTDOWN с местом
- * (и как можно больше народу в нём - чтобы стягивать игроков в один рум,
- * а не размазывать по нескольким), затем новый пустой, затем PLAYING с местом. */
+static int CountFactionInRoom(int room, int faction) {
+    int n = 0;
+    for (int i = 0; i < MAX_SERVER_SLOTS; i++) {
+        if (!clientConnected[i] || clientRoom[i] != room) continue;
+        if (clientStates[i].faction == faction) n++;
+    }
+    return n;
+}
+/* Автобаланс: вернуть фракцию с меньшим числом игроков (0=Щит, 1=Воля). */
+static int SuggestFactionForRoom(int room) {
+    int s = CountFactionInRoom(room, 0);
+    int v = CountFactionInRoom(room, 1);
+    return (s <= v) ? 0 : 1;
+}
+/* Если выбор клиента разбалансирует больше чем на 1 — принудительно.
+ * Вызывать при приёме STATE от клиента в руме. */
+static int BalanceFaction(int room, int wanted) {
+    if (wanted != 0 && wanted != 1) wanted = SuggestFactionForRoom(room);
+    int s = CountFactionInRoom(room, 0);
+    int v = CountFactionInRoom(room, 1);
+    /* не считаем самого клиента в wanted, если он уже в этой фракции —
+     * вызывающий передаёт wanted до записи в clientStates. */
+    if (wanted == 0) {
+        if (s > v + 1) return 1; /* Щит переполнен */
+    } else {
+        if (v > s + 1) return 0;
+    }
+    return wanted;
+}
+static void Rooms_TrimEmpty(void) {
+    /* Схлопнуть хвостовые пустые румы, оставив минимум 1 открытый. */
+    while (roomsOpen > 1) {
+        int last = roomsOpen - 1;
+        if (CountRoomPlayers(last) > 0) break;
+        rooms[last].phase = MATCH_WAITING;
+        rooms[last].scoreShield = rooms[last].scoreVolya = 0;
+        rooms[last].timeLeft = 0.f;
+        roomsOpen--;
+        printf("Rooms: closed empty room %d (open now %d)\n", last, roomsOpen);
+    }
+}
+/* Распределение:
+ * 1) Непустой WAITING/COUNTDOWN с местом — самый заполненный (малый онлайн стягиваем).
+ * 2) PLAYING с местом, если в руме ещё не «поздно» (есть < MAX и phase playing).
+ * 3) Новый пустой среди уже open.
+ * 4) Если все open заполнены — открыть следующий (до MAX_ROOMS).
+ * 5) Иначе full. */
 static int PickRoomForJoin(void) {
+    Rooms_TrimEmpty();
+
     int bestWait = -1, bestWaitN = -1;
-    for (int r = 0; r < MAX_ROOMS; r++) {
+    for (int r = 0; r < roomsOpen; r++) {
         int n = CountRoomPlayers(r);
-        if (n <= 0 || n >= MAX_PLAYERS) continue; // пустые - отдельная ветка ниже
+        if (n <= 0 || n >= MAX_PLAYERS) continue;
         if (rooms[r].phase == MATCH_WAITING || rooms[r].phase == MATCH_COUNTDOWN) {
             if (n > bestWaitN) { bestWaitN = n; bestWait = r; }
         }
     }
     if (bestWait >= 0) return bestWait;
-    for (int r = 0; r < MAX_ROOMS; r++) {
+
+    /* PLAYING с дыркой — только если рум не почти полный (иначе лучше новый) */
+    int bestPlay = -1, bestPlayN = 999;
+    for (int r = 0; r < roomsOpen; r++) {
+        int n = CountRoomPlayers(r);
+        if (n <= 0 || n >= MAX_PLAYERS) continue;
+        if (rooms[r].phase == MATCH_PLAYING) {
+            if (n < bestPlayN) { bestPlayN = n; bestPlay = r; }
+        }
+    }
+    if (bestPlay >= 0 && bestPlayN <= MAX_PLAYERS - 2) return bestPlay;
+
+    /* Пустой среди открытых */
+    for (int r = 0; r < roomsOpen; r++) {
         if (CountRoomPlayers(r) == 0) {
             rooms[r].phase = MATCH_WAITING;
             rooms[r].scoreShield = rooms[r].scoreVolya = 0;
@@ -130,16 +198,28 @@ static int PickRoomForJoin(void) {
             return r;
         }
     }
-    for (int r = 0; r < MAX_ROOMS; r++) {
-        if (CountRoomPlayers(r) < MAX_PLAYERS)
-            return r;
+
+    /* PLAYING с любым свободным местом */
+    if (bestPlay >= 0) return bestPlay;
+
+    /* Все открытые заполнены → открыть новый */
+    if (roomsOpen < MAX_ROOMS) {
+        int r = roomsOpen;
+        roomsOpen++;
+        rooms[r].phase = MATCH_WAITING;
+        rooms[r].scoreShield = rooms[r].scoreVolya = 0;
+        rooms[r].timeLeft = 0.f;
+        printf("Rooms: opened room %d (open now %d / %d)\n", r, roomsOpen, MAX_ROOMS);
+        return r;
     }
     return -1;
 }
 static int AllocSlotInRoom(int room) {
+    if (room < 0 || room >= MAX_ROOMS) return -1;
     int base = room * MAX_PLAYERS;
     for (int local = 0; local < MAX_PLAYERS; local++) {
         int g = base + local;
+        if (g >= MAX_SERVER_SLOTS) break;
         if (!clientConnected[g]) return g;
     }
     return -1;
@@ -461,7 +541,6 @@ static float ServerBlockRaycast(Vector3 o, Vector3 d, float maxDist) {
 // ---- серверное состояние ----
 static SOCKET listenSock = INVALID_SOCKET;
 static SOCKET clientSockets[MAX_SERVER_SLOTS];
-static PlayerState clientStates[MAX_SERVER_SLOTS];
 /* clientConnected объявлен выше (рядом с clientRoom) */
 static double clientLastSeen[MAX_SERVER_SLOTS];
 static bool clientMapTransferring[MAX_SERVER_SLOTS];
@@ -631,6 +710,14 @@ static void SetNonBlocking(SOCKET s) {
 static void SetTcpNoDelay(SOCKET s) {
     int flag = 1;
     setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char*)&flag, sizeof(flag));
+#if !defined(_WIN32) && defined(TCP_QUICKACK)
+    /* Linux: отключить delayed ACK — иначе +40..200мс к мелким пакетам (PING/STATE) */
+    setsockopt(s, IPPROTO_TCP, TCP_QUICKACK, (const char*)&flag, sizeof(flag));
+#endif
+    /* Чуть больше буферов — меньше блокировок send при burst snapshot */
+    int buf = 256 * 1024;
+    setsockopt(s, SOL_SOCKET, SO_SNDBUF, (const char*)&buf, sizeof(buf));
+    setsockopt(s, SOL_SOCKET, SO_RCVBUF, (const char*)&buf, sizeof(buf));
 }
 
 // Досылает данные целиком: send() на TCP может отправить меньше, чем
@@ -638,17 +725,20 @@ static void SetTcpNoDelay(SOCKET s) {
 static bool SendAll(SOCKET s, const void *data, size_t len) {
     const char *p = (const char*)data;
     size_t sent = 0;
+    int spins = 0;
     while (sent < len) {
         int n = send(s, p + sent, (int)(len - sent), 0);
-        if (n > 0) { sent += (size_t)n; continue; }
+        if (n > 0) { sent += (size_t)n; spins = 0; continue; }
 #ifdef _WIN32
         if (n == SOCKET_ERROR && WSAGetLastError() == WSAEWOULDBLOCK) {
-            Sleep(1); // не крутим CPU — ждём пока TCP-буфер освободится
+            if (++spins > 200) return false; /* ~20мс max stall */
+            Sleep(0); /* yield, не Sleep(1) */
             continue;
         }
 #else
         if (n < 0 && (errno == EWOULDBLOCK || errno == EAGAIN)) {
-            struct timespec ts = {0, 1000 * 1000}; // 1 мс
+            if (++spins > 200) return false;
+            struct timespec ts = {0, 50 * 1000}; /* 0.05 мс */
             nanosleep(&ts, NULL);
             continue;
         }
@@ -756,7 +846,7 @@ static bool StartListenSocket(int port) {
     if (bind(listenSock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
         closesocket(listenSock); listenSock = INVALID_SOCKET; return false;
     }
-    if (listen(listenSock, 16) < 0) {
+    if (listen(listenSock, 64) < 0) {
         closesocket(listenSock); listenSock = INVALID_SOCKET; return false;
     }
     SetNonBlocking(listenSock);
@@ -1626,6 +1716,7 @@ static void ClearClientSlot(int i) {
     clientLocalId[i] = -1;
     clientProbeCloseAt[i] = 0.0;
     rosterDirty = true;
+    Rooms_TrimEmpty();
 }
 
 static void ServerCheckTimeouts(void) {
@@ -1878,6 +1969,20 @@ bool Network_ReceiveSnapshot(GameSnapshot *snap) {
                         clientSpawnProtect[i] = 3.0f;
                     }
                     clientStates[i].spawnProtected = (clientSpawnProtect[i] > 0.0f) ? 1 : 0;
+                    /* автобаланс команд в руме */
+                    {
+                        int room = clientRoom[i];
+                        if (room >= 0 && room < MAX_ROOMS) {
+                            int want = clientStates[i].faction;
+                            /* временно убрать себя из подсчёта */
+                            int savedFac = clientStates[i].faction;
+                            clientStates[i].faction = -1;
+                            int bal = BalanceFaction(room, want);
+                            clientStates[i].faction = bal;
+                            if (bal != savedFac && want == savedFac)
+                                printf("Autobalance: slot %d room %d %d->%d\n", i, room, savedFac, bal);
+                        }
+                    }
                     clientMapTransferring[i] = false;
                     gotAny = true;
                 } else if (type == MSG_HITEVENT && len == sizeof(HitEvent)) {
@@ -2048,10 +2153,12 @@ bool Network_ReceiveSnapshot(GameSnapshot *snap) {
                 float rtt = (float)(nowMs - (double)sentMs);
                 if (rtt < 0.0f) rtt = 0.0f;
                 if (rtt > 60000.0f) rtt = 60000.0f;
-                currentPingMs = rtt;
+                /* EMA: сглаживаем выбросы через Railway proxy */
+                if (currentPingMs <= 0.1f) currentPingMs = rtt;
+                else currentPingMs = currentPingMs * 0.7f + rtt * 0.3f;
                 pingWaiting = false;
-                if (pongCount++ < 3)
-                    printf("Pong RTT=%.1f ms\n", rtt);
+                if (pongCount++ < 5)
+                    printf("Pong RTT=%.1f ms (ema=%.1f)\n", rtt, currentPingMs);
             }
         }
 
@@ -2075,7 +2182,7 @@ bool Network_ReceiveSnapshot(GameSnapshot *snap) {
         if (pingWaiting && (now - lastPingSentAt) > 3.0) {
             pingWaiting = false;
         }
-        if (!pingWaiting && (now - lastPingSentAt) > 1.0) {
+        if (!pingWaiting && (now - lastPingSentAt) > 0.5) {
             uint64_t sentMs = (uint64_t)(now * 1000.0);
             if (SendFramed(sock, MSG_PING, &sentMs, 8)) {
                 lastPingSentAt = now;
@@ -2164,7 +2271,7 @@ void Network_SeedPing(float ms) {
 void Network_Close(void) {
     if (isServer) {
         int base = hostPlaysToo ? 1 : 0;
-        for (int i = base; i < MAX_PLAYERS; i++) {
+        for (int i = base; i < MAX_SERVER_SLOTS; i++) {
             if (clientSockets[i] != INVALID_SOCKET) { closesocket(clientSockets[i]); clientSockets[i] = INVALID_SOCKET; }
         }
         if (listenSock != INVALID_SOCKET) { closesocket(listenSock); listenSock = INVALID_SOCKET; }

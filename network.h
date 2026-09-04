@@ -14,8 +14,8 @@
 #endif
 
 #define MAX_PLAYERS 8              // 4v4 в одном руме
-#define MAX_ROOMS 3                // скрытые параллельные матчи на dedicated
-#define MAX_SERVER_SLOTS (MAX_PLAYERS * MAX_ROOMS) /* 24 слота на сервере */
+#define MAX_ROOMS 6                // скрытые параллельные матчи (1..6 по онлайну)
+#define MAX_SERVER_SLOTS (MAX_PLAYERS * MAX_ROOMS) /* 48 слотов при 6 румах */
 #define SERVER_PORT 50000          // порт по умолчанию (он же "Internal Port" в Railway TCP Proxy)
 /* Макс. число зарегистрированных аккаунтов (ников) с одного IP. */
 #define MAX_ACCOUNTS_PER_IP 8
