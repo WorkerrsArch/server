@@ -1,7 +1,10 @@
-// -std=c11 (в отличие от -std=gnu11) отключает POSIX-расширения glibc —
-// без этого clock_gettime/CLOCK_MONOTONIC/getaddrinfo/struct addrinfo
-// не объявлены. Должно стоять до ЛЮБОГО #include в файле.
+// -std=c11 отключает POSIX/BSD-расширения glibc без feature macros.
+// _POSIX_C_SOURCE — clock_gettime/getaddrinfo; _DEFAULT_SOURCE — IFF_UP/IFF_LOOPBACK
+// (getifaddrs / net/if.h). Должно стоять до ЛЮБОГО #include.
 #define _POSIX_C_SOURCE 200809L
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE
+#endif
 
 #include "network.h"
 #ifndef NETWORK_HEADLESS_BUILD
@@ -21,9 +24,11 @@
     #pragma comment(lib, "ws2_32.lib")
 #else
     #include <arpa/inet.h>
-#include <ifaddrs.h>
-#include <net/if.h>
     #include <sys/socket.h>
+#ifndef NETWORK_HEADLESS_BUILD
+    #include <ifaddrs.h>
+    #include <net/if.h>
+#endif
     #include <sys/select.h>   // select() для ConnectWithTimeout
     #include <sys/stat.h>     // mkdir
     #include <netdb.h>
@@ -2307,6 +2312,21 @@ void Network_Close(void) {
 }
 
 
+
+/* ===================== LAN discovery (Wi-Fi host only; not on dedicated) ===================== */
+#ifdef NETWORK_HEADLESS_BUILD
+bool Network_GetLocalIPv4(char *out, int outMax) {
+    if (out && outMax > 0) out[0] = '\0';
+    return false;
+}
+void Network_LanBeaconStop(void) {}
+void Network_LanBeaconStart(int gamePort) { (void)gamePort; }
+void Network_LanBeaconTick(void) {}
+int Network_LanDiscover(char outAddrs[][64], int maxOut, int timeoutMs) {
+    (void)outAddrs; (void)maxOut; (void)timeoutMs;
+    return 0;
+}
+#else
 /* ===================== LAN discovery (Wi-Fi host only) ===================== */
 #define LAN_BEACON_PORT 50001
 #define LAN_MAGIC "MR01"
@@ -2440,3 +2460,4 @@ int Network_LanDiscover(char outAddrs[][64], int maxOut, int timeoutMs) {
     closesocket(s);
     return n;
 }
+#endif /* !NETWORK_HEADLESS_BUILD */
