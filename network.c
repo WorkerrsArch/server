@@ -301,13 +301,13 @@ static void Profile_LoadAll(void) {
         char name[PROFILE_NAME_MAX];
         int kills = 0, tokens = 0;
         char ip[46]; ip[0] = '\0';
-        /* name|kills|tokens|ip */
+        char pass[48]; pass[0] = '\0';
+        /* name|kills|tokens|ip|password */
         char *p1 = strchr(line, '|');
         if (!p1) continue;
         *p1 = '\0';
         strncpy(name, line, PROFILE_NAME_MAX - 1);
         name[PROFILE_NAME_MAX - 1] = '\0';
-        /* trim trailing spaces/CR */
         for (int i = (int)strlen(name) - 1; i >= 0 && (name[i] == ' ' || name[i] == '\r' || name[i] == '\n'); i--)
             name[i] = '\0';
         if (!name[0]) continue;
@@ -323,13 +323,25 @@ static void Profile_LoadAll(void) {
             ip[ipLen] = '\0';
             for (int i = (int)strlen(ip) - 1; i >= 0 && (ip[i] == ' ' || ip[i] == '\r' || ip[i] == '\n'); i--)
                 ip[i] = '\0';
+            if (p3) {
+                char *p4 = strchr(p3 + 1, '|');
+                const char *ps = p3 + 1;
+                size_t plen = p4 ? (size_t)(p4 - ps) : strlen(ps);
+                if (plen >= sizeof(pass)) plen = sizeof(pass) - 1;
+                memcpy(pass, ps, plen);
+                pass[plen] = '\0';
+                for (int i = (int)strlen(pass) - 1; i >= 0 && (pass[i] == ' ' || pass[i] == '\r' || pass[i] == '\n'); i--)
+                    pass[i] = '\0';
+            }
         }
         if (kills < 0) kills = 0;
         if (tokens < 0) tokens = 0;
+        memset(&g_profiles[g_profileCount], 0, sizeof(g_profiles[0]));
         strncpy(g_profiles[g_profileCount].name, name, PROFILE_NAME_MAX - 1);
         g_profiles[g_profileCount].kills = kills;
         g_profiles[g_profileCount].tokens = tokens;
         strncpy(g_profiles[g_profileCount].ip, ip, sizeof(g_profiles[g_profileCount].ip) - 1);
+        strncpy(g_profiles[g_profileCount].password, pass, sizeof(g_profiles[g_profileCount].password) - 1);
         g_profileCount++;
     }
     fclose(f);
@@ -338,8 +350,10 @@ static void Profile_SaveAll(void) {
     FILE *f = fopen(Profiles_Path(), "w");
     if (!f) return;
     for (int i = 0; i < g_profileCount; i++)
-        fprintf(f, "%s|%d|%d|%s\n", g_profiles[i].name, g_profiles[i].kills,
-                g_profiles[i].tokens, g_profiles[i].ip);
+        fprintf(f, "%s|%d|%d|%s|%s
+", g_profiles[i].name, g_profiles[i].kills,
+                g_profiles[i].tokens, g_profiles[i].ip,
+                g_profiles[i].password[0] ? g_profiles[i].password : "");
     fclose(f);
 }
 /* Сколько уже зарегистрированных аккаунтов с этого IP (не считая профиль excludeIdx) */
@@ -354,11 +368,38 @@ static int Profile_CountByIp(const char *ip, int excludeIdx) {
 }
 /* outLimited: если по IP уже MAX_ACCOUNTS_PER_IP аккаунтов и это НОВЫЙ ник — 
  * профиль не создаётся, возвращается -1 и *outLimited = true. */
-static int Profile_GetOrCreate(const char *name, const char *ip, bool *outLimited) {
+/* outWrongPass: 1 = неверный пароль; outNeedPass: 1 = при регистрации пароль пуст.
+ * outLimited: лимит IP. Возврат -1 = отказ, >=0 = индекс профиля. */
+static int Profile_LoginOrCreate(const char *name, const char *ip, const char *password,
+                                 bool *outLimited, bool *outWrongPass, bool *outNeedPass) {
     Profile_LoadAll();
     if (outLimited) *outLimited = false;
+    if (outWrongPass) *outWrongPass = false;
+    if (outNeedPass) *outNeedPass = false;
     int idx = Profile_Find(name);
-    if (idx >= 0) return idx;
+    if (idx >= 0) {
+        /* существующий аккаунт */
+        if (g_profiles[idx].password[0]) {
+            if (!password || strcmp(g_profiles[idx].password, password) != 0) {
+                if (outWrongPass) *outWrongPass = true;
+                return -1;
+            }
+        } else if (password && password[0]) {
+            /* legacy без пароля — задаём при первом успешном входе */
+            strncpy(g_profiles[idx].password, password, sizeof(g_profiles[idx].password) - 1);
+            Profile_SaveAll();
+        }
+        if (ip && ip[0] && !g_profiles[idx].ip[0]) {
+            strncpy(g_profiles[idx].ip, ip, sizeof(g_profiles[idx].ip) - 1);
+            Profile_SaveAll();
+        }
+        return idx;
+    }
+    /* новый ник */
+    if (!password || !password[0]) {
+        if (outNeedPass) *outNeedPass = true;
+        return -1;
+    }
     if (g_profileCount >= PROFILE_MAX_STORE) return -1;
     if (ip && ip[0] && Profile_CountByIp(ip, -1) >= MAX_ACCOUNTS_PER_IP) {
         if (outLimited) *outLimited = true;
@@ -369,6 +410,7 @@ static int Profile_GetOrCreate(const char *name, const char *ip, bool *outLimite
     strncpy(g_profiles[idx].name, name, PROFILE_NAME_MAX - 1);
     g_profiles[idx].name[PROFILE_NAME_MAX - 1] = '\0';
     if (ip) strncpy(g_profiles[idx].ip, ip, sizeof(g_profiles[idx].ip) - 1);
+    strncpy(g_profiles[idx].password, password, sizeof(g_profiles[idx].password) - 1);
     Profile_SaveAll();
     return idx;
 }
@@ -1404,7 +1446,7 @@ bool Network_ProbeServerEx(const char *addr, int timeoutMs, float *outPingMs,
     return true;
 }
 
-void Network_SendProfileLogin(const char *name) {
+void Network_SendProfileLogin(const char *name, const char *password) {
     if (isServer || sock == INVALID_SOCKET) return;
     ProfileLoginMsg pl = {0};
     if (name && name[0]) {
@@ -1412,6 +1454,10 @@ void Network_SendProfileLogin(const char *name) {
         pl.name[PROFILE_NAME_MAX - 1] = '\0';
     } else {
         strncpy(pl.name, "Player", PROFILE_NAME_MAX - 1);
+    }
+    if (password && password[0]) {
+        strncpy(pl.password, password, sizeof(pl.password) - 1);
+        pl.password[sizeof(pl.password) - 1] = '\0';
     }
     SendFramed(sock, MSG_PROFILE_LOGIN, &pl, sizeof(pl));
 }
@@ -1975,6 +2021,14 @@ bool Network_ReceiveSnapshot(GameSnapshot *snap) {
                     float authHealth = clientStates[i].health;
                     bool authAlive = clientStates[i].alive;
                     clientStates[i] = newState;
+                    if (clientNames[i][0]) {
+                        strncpy(clientStates[i].name, clientNames[i], PROFILE_NAME_MAX - 1);
+                        clientStates[i].name[PROFILE_NAME_MAX - 1] = '\0';
+                    } else if (newState.name[0]) {
+                        strncpy(clientNames[i], newState.name, PROFILE_NAME_MAX - 1);
+                        clientNames[i][PROFILE_NAME_MAX - 1] = '\0';
+                        strncpy(clientStates[i].name, clientNames[i], PROFILE_NAME_MAX - 1);
+                    }
                     if (!respawn) {
                         clientStates[i].health = authHealth;
                         clientStates[i].alive = authAlive;
@@ -2044,9 +2098,9 @@ bool Network_ReceiveSnapshot(GameSnapshot *snap) {
                     ProfileLoginMsg pl;
                     memcpy(&pl, payload, sizeof(pl));
                     pl.name[PROFILE_NAME_MAX - 1] = '\0';
+                    pl.password[sizeof(pl.password) - 1] = '\0';
                     const char *wantName = pl.name[0] ? pl.name : "Player";
 
-                    /* Ник уже активен у другого подключённого игрока — не пускаем. */
                     bool nameTaken = false;
                     for (int j = 0; j < MAX_SERVER_SLOTS; j++) {
                         if (j == i || !clientConnected[j]) continue;
@@ -2062,29 +2116,30 @@ bool Network_ReceiveSnapshot(GameSnapshot *snap) {
                         clientProfileIdx[i] = -1;
                         printf("Profile login slot %d REJECTED: nick '%s' already in play\n", i, wantName);
                     } else {
-                        bool limited = false;
-                        int pidx = Profile_GetOrCreate(wantName, clientIP[i], &limited);
-                        if (pidx < 0 && limited) {
-                            info.rejected = 2;
+                        bool limited = false, wrong = false, needPass = false;
+                        int pidx = Profile_LoginOrCreate(wantName, clientIP[i], pl.password,
+                                                         &limited, &wrong, &needPass);
+                        if (pidx < 0) {
+                            if (wrong) info.rejected = 3;
+                            else if (needPass) info.rejected = 4;
+                            else if (limited) info.rejected = 2;
+                            else info.rejected = 3;
                             clientProfileIdx[i] = -1;
-                            printf("Profile login slot %d REJECTED: IP %s hit %d-account limit\n",
-                                   i, clientIP[i], MAX_ACCOUNTS_PER_IP);
+                            printf("Profile login slot %d REJECTED: nick='%s' code=%d\n",
+                                   i, wantName, info.rejected);
                         } else {
                             strncpy(clientNames[i], wantName, PROFILE_NAME_MAX - 1);
                             clientNames[i][PROFILE_NAME_MAX - 1] = '\0';
                             clientProfileIdx[i] = pidx;
-                            if (pidx >= 0) {
-                                info.tokens = g_profiles[pidx].tokens;
-                                info.kills = g_profiles[pidx].kills;
-                                info.rank = Profile_RankOf(pidx);
-                            }
+                            info.tokens = g_profiles[pidx].tokens;
+                            info.kills = g_profiles[pidx].kills;
+                            info.rank = Profile_RankOf(pidx);
                             printf("Profile login slot %d: %s (kills=%d tokens=%d rank=%d)\n",
                                    i, clientNames[i], info.kills, info.tokens, info.rank);
                         }
                     }
                     SendFramed(cs, MSG_PROFILE_INFO, &info, sizeof(info));
                     if (info.rejected) {
-                        /* Короткая жизнь слота — клиент успеет получить info, потом рвём. */
                         clientProbeCloseAt[i] = Net_Now() + 0.5;
                     }
                 } else if (type == MSG_LB_REQ) {

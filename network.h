@@ -62,6 +62,7 @@ typedef struct {
     float speed;
     /* 1 = неуязвим после респавна (сервер не считает урон) */
     unsigned char spawnProtected;
+    char name[40]; /* ник для MVP/табло; синхрон с PROFILE_NAME_MAX */
 } PlayerState;
 
 typedef struct {
@@ -108,14 +109,18 @@ typedef struct {
 
 typedef struct {
     char name[PROFILE_NAME_MAX]; /* «Имя Кличка» UTF-8 */
+    char password[48];           /* пароль ника (на сервере в profiles.dat) */
 } ProfileLoginMsg;
 
 typedef struct {
     int tokens;
     int kills;
     int rank; /* 1..N, 0 если вне топа */
-    /* 0 = ок; 1 = ник уже в игре у другого игрока; 2 = лимит аккаунтов
-     * с этого IP (см. MAX_ACCOUNTS_PER_IP) */
+    /* 0 = ок
+     * 1 = ник уже в игре
+     * 2 = лимит аккаунтов с IP
+     * 3 = неверный пароль
+     * 4 = нужно задать пароль (пустой при регистрации) */
     int rejected;
 } ProfileInfoMsg;
 
@@ -173,7 +178,7 @@ bool Network_ProbeServerEx(const char *addr, int timeoutMs, float *outPingMs,
                            int *outPlayerCount, int *outMaxPlayers);
 
 /* Профиль: после коннекта клиент шлёт ник → сервер отвечает tokens/kills/rank */
-void Network_SendProfileLogin(const char *name);
+void Network_SendProfileLogin(const char *name, const char *password);
 bool Network_ReceiveProfileInfo(ProfileInfoMsg *out);
 /* Запрос/получение Топ-100 (можно без полного гейм-коннекта через probe-сессию
  * или после коннекта). Для UI используем кэш последнего ответа. */
