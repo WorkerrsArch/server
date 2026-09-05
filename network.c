@@ -269,7 +269,8 @@ typedef struct {
     char name[PROFILE_NAME_MAX];
     int kills;
     int tokens;
-    char ip[46]; /* IPv4/IPv6 текстом, пусто = неизвестно (старые записи) */
+    char ip[46]; /* IPv4/IPv6 */
+    char password[48]; /* empty = legacy */
 } StoredProfile;
 static StoredProfile g_profiles[PROFILE_MAX_STORE];
 static int g_profileCount = 0;
@@ -349,11 +350,12 @@ static void Profile_LoadAll(void) {
 static void Profile_SaveAll(void) {
     FILE *f = fopen(Profiles_Path(), "w");
     if (!f) return;
-    for (int i = 0; i < g_profileCount; i++)
-        fprintf(f, "%s|%d|%d|%s|%s
-", g_profiles[i].name, g_profiles[i].kills,
+    for (int i = 0; i < g_profileCount; i++) {
+        fprintf(f, "%s|%d|%d|%s|%s\n",
+                g_profiles[i].name, g_profiles[i].kills,
                 g_profiles[i].tokens, g_profiles[i].ip,
                 g_profiles[i].password[0] ? g_profiles[i].password : "");
+    }
     fclose(f);
 }
 /* Сколько уже зарегистрированных аккаунтов с этого IP (не считая профиль excludeIdx) */
